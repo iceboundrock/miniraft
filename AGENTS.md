@@ -641,3 +641,32 @@ When working in this repository:
 - stop scope creep early
 
 The project exists to make Raft understandable. Code that is easier to prove correct and easier to study is preferred over code that is merely shorter or faster.
+
+## Non-code artifacts
+
+Anything a task produces that is not code (design docs, specs, plans, research notes, assessments) must end up on GitHub. A copy on disk alone does not count.
+
+- Write non-code artifacts in English (see the Language rule above).
+- Post the artifact as a comment on the relevant issue. If the work has no issue yet, create one first; if the artifact is about changes already under review, post it to the PR instead.
+- Post the full content, not a summary or a file path.
+- Do not force-add gitignored planning files to make them shareable. The issue comment is the sharing mechanism.
+- Say in the comment which artifact it is and where the working copy lives, so a later reader knows whether they are looking at a plan, a spec, or a review.
+- Anything that must become a durable repository convention still belongs in that repo's `docs/` (an ADR, runbook, or reference page). The issue comment records the thinking; `docs/` records the decision.
+
+## PR rules
+
+- Do not merge a PR unless I explicitly ask you to.
+- When reviewing a PR, post everything (findings, spec and standards checks, assessment, observations, verification, summary) as one comment on the PR.
+- When I ask you to merge a PR, squash-merge by default unless I ask for something else.
+- After a PR is merged, clean up local branches and worktrees, fast-forward main, then update and close related issues.
+
+## Git conventions
+
+Never include AI attribution in commit messages, PR titles, or PR descriptions, in any form. That means no
+
+- `Co-Authored-By: Claude`
+- `Generated with ...` footers
+- sign-offs or footers naming an LLM or AI agent (OpenAI, GPT, Claude, Anthropic, and the like)
+- `Claude-Session:` trailers or session URLs (`https://claude.ai/code/session_...`), even when a tool inserts them automatically
+
+When squash-merging, write a clean commit message that describes only the change itself.
