@@ -1,0 +1,102 @@
+package simulator
+
+import "time"
+
+// TimerID identifies a timer created by Clock.After. The zero value never
+// identifies a timer, so hosts can use it to mean "no timer armed".
+type TimerID uint64
+
+// Clock is the simulated clock. Time is a logical time.Duration since the
+// start of the simulation and only moves when the test calls Advance or Step;
+// nothing in the simulator reads wall-clock time.
+//
+// Clock owns the EventQueue: every timer and every message delivery is an
+// event in the same queue, so "what happens next" has exactly one answer.
+// Invariant: Now() <= At of every pending event.
+type Clock struct {
+	now    time.Duration
+	queue  EventQueue
+	timers map[TimerID]*Event
+}
+
+// NewClock returns a clock at time 0 with no timers.
+func NewClock() *Clock {
+	return &Clock{timers: make(map[TimerID]*Event)}
+}
+
+// Now returns the current logical time.
+func (c *Clock) Now() time.Duration { return c.now }
+
+// After arms a timer that runs fn at Now()+d. Timers fire in deadline order;
+// timers with the same deadline fire in the order they were armed. The timer
+// can be cancelled with Stop until it fires.
+func (c *Clock) After(d time.Duration, fn func()) TimerID {
+	if d < 0 {
+		panic("simulator: Clock.After with negative duration")
+	}
+	ev := c.queue.Push(c.now+d, fn)
+	id := TimerID(ev.Seq) // Seq is unique, so it doubles as the timer id.
+	c.timers[id] = ev
+	return id
+}
+
+// Stop cancels a timer. It reports whether the timer was pending: false for
+// a timer that already fired, was already stopped, or the zero TimerID.
+func (c *Clock) Stop(id TimerID) bool {
+	ev, ok := c.timers[id]
+	if !ok {
+		return false
+	}
+	delete(c.timers, id)
+	return c.queue.Cancel(ev)
+}
+
+// Advance moves time forward by d, firing every timer whose deadline is
+// <= Now()+d in order. While a callback runs, Now() equals its deadline;
+// timers armed by a callback with a deadline inside the window fire in the
+// same call. Afterwards Now() == the target time even if no timer fired.
+func (c *Clock) Advance(d time.Duration) {
+	if d < 0 {
+		panic("simulator: Clock.Advance with negative duration")
+	}
+	target := c.now + d
+	for {
+		ev := c.queue.Peek()
+		if ev == nil || ev.At > target {
+			break
+		}
+		c.fire()
+	}
+	c.now = target
+}
+
+// Step fires the next pending event, moving Now() to its deadline. It
+// reports false, and leaves the clock unchanged, when nothing is pending.
+func (c *Clock) Step() bool {
+	if c.queue.Peek() == nil {
+		return false
+	}
+	c.fire()
+	return true
+}
+
+// NextDeadline returns the deadline of the earliest pending event.
+func (c *Clock) NextDeadline() (time.Duration, bool) {
+	ev := c.queue.Peek()
+	if ev == nil {
+		return 0, false
+	}
+	return ev.At, true
+}
+
+// Pending returns the number of armed, not-yet-fired timers.
+func (c *Clock) Pending() int { return c.queue.Len() }
+
+// fire pops and runs the earliest event. The queue is ordered and Now() never
+// exceeds a pending deadline, so setting now = ev.At never moves time back.
+func (c *Clock) fire() {
+	ev := c.queue.Pop()
+	delete(c.timers, TimerID(ev.Seq))
+	c.now = ev.At
+	ev.Fn()
+}
