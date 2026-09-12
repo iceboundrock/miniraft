@@ -27,8 +27,8 @@ type Storage interface {
 	SaveTermVote(term Term, votedFor NodeID) error
 	// AppendEntries durably appends entries, which must be a well-formed
 	// suffix starting at the current last index + 1 (see ValidateEntries:
-	// contiguous indexes, non-zero terms). The call is all-or-nothing: on
-	// error the stored log is unchanged.
+	// indexes >= 1, contiguous without wrapping, non-zero terms). The call is
+	// all-or-nothing: on error the stored log is unchanged.
 	AppendEntries(entries []LogEntry) error
 	// TruncateSuffix durably deletes every entry with Index >= fromIndex.
 	TruncateSuffix(fromIndex Index) error

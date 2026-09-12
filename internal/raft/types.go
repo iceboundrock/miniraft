@@ -16,6 +16,7 @@ package raft
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 )
 
@@ -89,18 +90,34 @@ func CloneEntries(entries []LogEntry) []LogEntry {
 }
 
 // ValidateEntries reports whether entries form a well-formed log suffix
-// starting at index first: indexes are contiguous from first and every term is
-// non-zero. It is the single definition of "acceptable entries" shared by the
-// log, Storage implementations and AppendEntries validation, so that a
-// malformed batch is rejected at whichever boundary it arrives.
+// starting at index first: first is a real log index (>= 1), indexes are
+// contiguous from first without wrapping past the maximum Index, and every
+// term is non-zero. It is the single definition of "acceptable entries"
+// shared by the log, Storage implementations and AppendEntries validation, so
+// that a malformed batch is rejected at whichever boundary it arrives.
+//
+// first == 0 is rejected even for an empty batch: it can only arise from
+// PrevLogIndex+1 wrapping (Message.Validate) or from a caller mistaking the
+// sentinel for a real position, and both are malformed.
 func ValidateEntries(entries []LogEntry, first Index) error {
+	if first == 0 {
+		return errors.New("raft: entries cannot start at index 0 (reserved for the sentinel)")
+	}
+	// want is advanced one entry at a time instead of computed as
+	// first+Index(i) so that wrapping is observable: with first >= 1 it can
+	// only become 0 by overflowing the maximum index.
+	want := first
 	for i, e := range entries {
-		if want := first + Index(i); e.Index != want {
+		if want == 0 {
+			return fmt.Errorf("raft: entry %d would exceed the maximum log index", i)
+		}
+		if e.Index != want {
 			return fmt.Errorf("raft: entry %d has index %d, want %d", i, e.Index, want)
 		}
 		if e.Term == 0 {
 			return fmt.Errorf("raft: entry at index %d has term 0 (reserved for the sentinel)", e.Index)
 		}
+		want++
 	}
 	return nil
 }

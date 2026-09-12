@@ -97,6 +97,10 @@ func TestValidateEntries(t *testing.T) {
 		{"gap", entries([2]uint64{1, 1}, [2]uint64{3, 1}), 1, false},
 		{"term zero", entries([2]uint64{1, 0}), 1, false},
 		{"term zero later", entries([2]uint64{1, 1}, [2]uint64{2, 0}), 1, false},
+		{"first is the sentinel index", entries([2]uint64{0, 1}), 0, false},
+		{"first is the sentinel index, no entries", nil, 0, false},
+		{"last representable index", entries([2]uint64{^uint64(0), 1}), ^Index(0), true},
+		{"index wraps past the maximum", entries([2]uint64{^uint64(0), 1}, [2]uint64{0, 1}), ^Index(0), false},
 	}
 	for _, tc := range cases {
 		err := ValidateEntries(tc.entries, tc.first)
@@ -117,9 +121,12 @@ func TestMessageValidateAppendEntriesPayload(t *testing.T) {
 		t.Fatalf("heartbeat rejected: %v", err)
 	}
 	bad := map[string]Message{
-		"entries do not follow PrevLogIndex": ae(7, entries([2]uint64{9, 1})),
-		"gap inside entries":                 ae(7, entries([2]uint64{8, 1}, [2]uint64{10, 1})),
-		"term-0 entry":                       ae(7, entries([2]uint64{8, 0})),
+		"entries do not follow PrevLogIndex":              ae(7, entries([2]uint64{9, 1})),
+		"gap inside entries":                              ae(7, entries([2]uint64{8, 1}, [2]uint64{10, 1})),
+		"term-0 entry":                                    ae(7, entries([2]uint64{8, 0})),
+		"PrevLogIndex at maximum wraps first to sentinel": ae(^Index(0), entries([2]uint64{0, 1})),
+		"PrevLogIndex at maximum heartbeat":               ae(^Index(0), nil),
+		"entries wrap past the maximum index":             ae(^Index(0)-1, entries([2]uint64{^uint64(0), 1}, [2]uint64{0, 1})),
 	}
 	for name, m := range bad {
 		if m.Validate() == nil {
