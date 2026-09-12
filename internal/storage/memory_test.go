@@ -51,11 +51,12 @@ func TestMemoryStorage(t *testing.T) {
 		t.Fatalf("Load() = %+v, want %+v", s, want)
 	}
 
-	// Load must return a copy.
+	// Load must return a deep copy, including Command bytes.
 	s.Entries[0].Term = 99
+	s.Entries[0].Command[0] = 0xff
 	s2, _ := st.Load()
-	if s2.Entries[0].Term != 1 {
-		t.Fatal("Load must copy entries")
+	if s2.Entries[0].Term != 1 || s2.Entries[0].Command[0] != 1 {
+		t.Fatal("Load must deep-copy entries")
 	}
 
 	if err := st.TruncateSuffix(0); err != nil {
@@ -70,5 +71,31 @@ func TestMemoryStorage(t *testing.T) {
 	}
 	if _, err := st.Load(); err != ErrClosed {
 		t.Fatalf("Load after Close = %v, want ErrClosed", err)
+	}
+}
+
+func TestMemoryStorageAppendCopiesCommand(t *testing.T) {
+	st := NewMemoryStorage()
+	in := entries([2]uint64{1, 1})
+	if err := st.AppendEntries(in); err != nil {
+		t.Fatal(err)
+	}
+	in[0].Command[0] = 0xff
+	s, _ := st.Load()
+	if s.Entries[0].Command[0] != 1 {
+		t.Fatal("AppendEntries must not share Command bytes with the caller")
+	}
+}
+
+func TestMemoryStorageAppendIsAtomic(t *testing.T) {
+	st := NewMemoryStorage()
+	// Valid prefix (index 1) followed by an invalid suffix (index 3): nothing
+	// may be appended.
+	if err := st.AppendEntries(entries([2]uint64{1, 1}, [2]uint64{3, 1})); err == nil {
+		t.Fatal("AppendEntries accepted an index gap")
+	}
+	s, _ := st.Load()
+	if len(s.Entries) != 0 {
+		t.Fatalf("partial append: store has %d entries, want 0", len(s.Entries))
 	}
 }

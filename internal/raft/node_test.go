@@ -20,10 +20,11 @@ func TestNewNodeLoadsPersistentState(t *testing.T) {
 		t.Fatalf("Status() = %+v, want %+v", got, want)
 	}
 
-	// The node must own its copy of the log.
+	// The node must own its copy of the log, including Command bytes.
 	st.state.Entries[0].Term = 99
-	if n.Status().LastLogIndex != 3 || n.log.termAt(1) != 2 {
-		t.Fatal("node must copy loaded entries")
+	st.state.Entries[0].Command[0] = 0xff
+	if n.Status().LastLogIndex != 3 || n.log.termAt(1) != 2 || n.log.entryAt(1).Command[0] != 1 {
+		t.Fatal("node must deep-copy loaded entries")
 	}
 }
 
@@ -43,21 +44,37 @@ func TestNewNodeRejectsNonContiguousLog(t *testing.T) {
 }
 
 func TestNewNodeValidatesConfig(t *testing.T) {
-	bad := []Config{
-		func() Config { c := testConfig("a"); c.ID = None; return c }(),
-		func() Config { c := testConfig("a", "a"); return c }(),
-		func() Config { c := testConfig("a", "b", "b"); return c }(),
-		func() Config {
+	bad := map[string]Config{
+		"empty ID":       func() Config { c := testConfig("a"); c.ID = None; return c }(),
+		"self peer":      testConfig("a", "a"),
+		"duplicate peer": testConfig("a", "b", "b"),
+		"None peer":      testConfig("a", "b", None),
+		"max < min": func() Config {
 			c := testConfig("a")
 			c.ElectionTimeoutMax = c.ElectionTimeoutMin - time.Millisecond
 			return c
 		}(),
-		func() Config { c := testConfig("a"); c.HeartbeatInterval = 0; return c }(),
+		"zero heartbeat": func() Config { c := testConfig("a"); c.HeartbeatInterval = 0; return c }(),
+		"heartbeat == election min": func() Config {
+			c := testConfig("a")
+			c.HeartbeatInterval = c.ElectionTimeoutMin
+			return c
+		}(),
+		"nil Rand": func() Config { c := testConfig("a"); c.Rand = nil; return c }(),
 	}
-	for i, cfg := range bad {
+	for name, cfg := range bad {
 		if _, err := NewNode(cfg, &memStorage{}, nopSM{}); err == nil {
-			t.Errorf("case %d: NewNode accepted invalid config", i)
+			t.Errorf("%s: NewNode accepted invalid config", name)
 		}
+	}
+}
+
+func TestNewNodeRejectsNilDependencies(t *testing.T) {
+	if _, err := NewNode(testConfig("a"), nil, nopSM{}); err == nil {
+		t.Error("NewNode accepted nil storage")
+	}
+	if _, err := NewNode(testConfig("a"), &memStorage{}, nil); err == nil {
+		t.Error("NewNode accepted nil state machine")
 	}
 }
 

@@ -14,7 +14,10 @@
 // paper line by line.
 package raft
 
-import "fmt"
+import (
+	"bytes"
+	"fmt"
+)
 
 // NodeID identifies a Raft server. The empty string means "no node" and is
 // used for votedFor when the node has not voted in the current term.
@@ -56,10 +59,28 @@ func (r Role) String() string {
 }
 
 // LogEntry is one entry in the replicated log.
+//
+// Command is replicated state-machine input and must never change once the
+// entry is in a log. Every log boundary (raftLog, Storage, outgoing messages)
+// therefore deep-copies entries with CloneEntries so that a caller mutating
+// its own slice afterwards cannot alter what a node will apply.
 type LogEntry struct {
 	Index   Index  `json:"index"`
 	Term    Term   `json:"term"`
 	Command []byte `json:"command"`
+}
+
+// CloneEntries returns a deep copy of entries: the slice and every Command
+// are freshly allocated. It returns nil for an empty input.
+func CloneEntries(entries []LogEntry) []LogEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]LogEntry, len(entries))
+	for i, e := range entries {
+		out[i] = LogEntry{Index: e.Index, Term: e.Term, Command: bytes.Clone(e.Command)}
+	}
+	return out
 }
 
 // RequestVote is the RequestVote RPC request (Figure 2). It is sent by a
@@ -145,19 +166,30 @@ type Message struct {
 // Term returns the term carried by the payload. Every Raft RPC and reply
 // carries the sender's term, which is what the "higher term ⇒ step down" rule
 // inspects.
+//
+// A malformed envelope (unknown Type, or the payload selected by Type is nil)
+// yields 0, the "no term" sentinel, rather than panicking; use Validate to
+// diagnose it. Term never inspects a payload that does not match Type.
 func (m Message) Term() Term {
 	switch m.Type {
 	case MsgRequestVote:
-		return m.RequestVote.Term
+		if m.RequestVote != nil {
+			return m.RequestVote.Term
+		}
 	case MsgRequestVoteResponse:
-		return m.RequestVoteResponse.Term
+		if m.RequestVoteResponse != nil {
+			return m.RequestVoteResponse.Term
+		}
 	case MsgAppendEntries:
-		return m.AppendEntries.Term
+		if m.AppendEntries != nil {
+			return m.AppendEntries.Term
+		}
 	case MsgAppendEntriesResponse:
-		return m.AppendEntriesResponse.Term
-	default:
-		return 0
+		if m.AppendEntriesResponse != nil {
+			return m.AppendEntriesResponse.Term
+		}
 	}
+	return 0
 }
 
 // Validate reports whether the envelope is well formed: Type is known and the

@@ -13,6 +13,10 @@ type PersistentState struct {
 // SaveTermVote or AppendEntries has returned nil, a crash cannot lose that
 // write. Implementations live in internal/storage.
 //
+// Ownership: entries passed to AppendEntries and returned by Load never share
+// memory with the caller (see CloneEntries), so neither side can alter the
+// other's Command bytes after the call.
+//
 // The interface is declared here rather than in internal/storage because the
 // core is the consumer and this keeps raft a leaf package (no import cycle).
 type Storage interface {
@@ -21,8 +25,9 @@ type Storage interface {
 	// SaveTermVote durably records currentTerm and votedFor together. They are
 	// always written as a pair because a vote is only meaningful in its term.
 	SaveTermVote(term Term, votedFor NodeID) error
-	// AppendEntries durably appends entries; entries[0].Index must equal the
-	// current last index + 1.
+	// AppendEntries durably appends entries, which must be contiguous and
+	// start at the current last index + 1. The call is all-or-nothing: on
+	// error the stored log is unchanged.
 	AppendEntries(entries []LogEntry) error
 	// TruncateSuffix durably deletes every entry with Index >= fromIndex.
 	TruncateSuffix(fromIndex Index) error

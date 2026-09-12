@@ -16,6 +16,9 @@ func TestRaftLogEmpty(t *testing.T) {
 	if l.matches(1, 0) {
 		t.Fatal("empty log must not match prevIndex 1")
 	}
+	if l.matches(0, 5) {
+		t.Fatal("sentinel index 0 must only match term 0")
+	}
 	if got := l.entriesFrom(1); got != nil {
 		t.Fatalf("entriesFrom(1) = %v, want nil", got)
 	}
@@ -37,6 +40,7 @@ func TestRaftLogHelpers(t *testing.T) {
 		{"termAt(3)", l.termAt(3), Term(2)},
 		{"termAt(beyond)", l.termAt(9), Term(0)},
 		{"matches(0,0)", l.matches(0, 0), true},
+		{"matches(0,99)", l.matches(0, 99), false}, // sentinel index 0 has term 0
 		{"matches(3,2)", l.matches(3, 2), true},
 		{"matches(3,1)", l.matches(3, 1), false},
 		{"matches(5,3)", l.matches(5, 3), false},
@@ -50,11 +54,23 @@ func TestRaftLogHelpers(t *testing.T) {
 		}
 	}
 
-	// entriesFrom must return a copy so callers cannot mutate the log.
+	// entriesFrom must return a deep copy so callers cannot mutate the log,
+	// including the Command bytes.
 	cp := l.entriesFrom(1)
 	cp[0].Term = 99
-	if l.termAt(1) != 1 {
-		t.Fatal("entriesFrom must copy entries")
+	cp[0].Command[0] = 0xff
+	if l.termAt(1) != 1 || l.entryAt(1).Command[0] != 1 {
+		t.Fatal("entriesFrom must deep-copy entries")
+	}
+}
+
+func TestRaftLogAppendCopiesCommand(t *testing.T) {
+	var l raftLog
+	in := entries([2]uint64{1, 1})
+	l.append(in...)
+	in[0].Command[0] = 0xff
+	if l.entryAt(1).Command[0] != 1 {
+		t.Fatal("append must not share Command bytes with the caller")
 	}
 }
 

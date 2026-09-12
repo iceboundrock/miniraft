@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"math/rand"
@@ -22,14 +23,16 @@ func testConfig(id NodeID, peers ...NodeID) Config {
 }
 
 // memStorage is a minimal in-package raft.Storage so that raft tests do not
-// import internal/storage (which imports raft). It is intentionally tiny.
+// import internal/storage (which imports raft). It is intentionally tiny but
+// honors the same contract as storage.MemoryStorage: contiguous, all-or-nothing
+// appends and no shared Command bytes.
 type memStorage struct {
 	state PersistentState
 }
 
 func (m *memStorage) Load() (PersistentState, error) {
 	s := m.state
-	s.Entries = append([]LogEntry(nil), m.state.Entries...)
+	s.Entries = CloneEntries(m.state.Entries)
 	return s, nil
 }
 
@@ -39,7 +42,12 @@ func (m *memStorage) SaveTermVote(term Term, votedFor NodeID) error {
 }
 
 func (m *memStorage) AppendEntries(entries []LogEntry) error {
-	m.state.Entries = append(m.state.Entries, entries...)
+	for i, e := range entries {
+		if want := Index(len(m.state.Entries) + i + 1); e.Index != want {
+			return fmt.Errorf("memStorage: append index %d, want %d", e.Index, want)
+		}
+	}
+	m.state.Entries = append(m.state.Entries, CloneEntries(entries)...)
 	return nil
 }
 

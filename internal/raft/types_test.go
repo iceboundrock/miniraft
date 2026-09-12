@@ -62,3 +62,23 @@ func TestMessageValidate(t *testing.T) {
 		}
 	}
 }
+
+func TestMessageTermMalformed(t *testing.T) {
+	// Term must not panic on a malformed envelope; it reports 0 (no term) and
+	// leaves the diagnosis to Validate.
+	bad := []Message{
+		{Type: MsgRequestVote},
+		{Type: MsgRequestVoteResponse},
+		{Type: MsgAppendEntries},
+		{Type: MsgAppendEntriesResponse},
+		{Type: 0, RequestVote: &RequestVote{Term: 3}},
+	}
+	for i, m := range bad {
+		if got := m.Term(); got != 0 {
+			t.Errorf("case %d: Term() = %d, want 0", i, got)
+		}
+		if m.Validate() == nil {
+			t.Errorf("case %d: Validate() = nil, want error", i)
+		}
+	}
+}

@@ -39,8 +39,9 @@ func (l *raftLog) entryAt(i Index) LogEntry {
 	return l.entries[i-1]
 }
 
-// entriesFrom returns a copy of all entries with Index >= from. It returns
-// nil when from is beyond the log.
+// entriesFrom returns a deep copy of all entries with Index >= from (see
+// CloneEntries), so that outgoing messages never share Command bytes with the
+// log. It returns nil when from is beyond the log.
 func (l *raftLog) entriesFrom(from Index) []LogEntry {
 	if from == 0 {
 		from = 1
@@ -48,27 +49,26 @@ func (l *raftLog) entriesFrom(from Index) []LogEntry {
 	if from > l.lastIndex() {
 		return nil
 	}
-	out := make([]LogEntry, l.lastIndex()-from+1)
-	copy(out, l.entries[from-1:])
-	return out
+	return CloneEntries(l.entries[from-1:])
 }
 
 // matches reports whether the log contains an entry at prevIndex with term
-// prevTerm — the AppendEntries consistency check. Index 0 always matches.
+// prevTerm — the AppendEntries consistency check. The sentinel index 0 is
+// always present with term 0, so (0, 0) matches every log and (0, t≠0)
+// matches none: a Leader never produces the latter, so it is rejected like
+// any other mismatch instead of being special-cased.
 func (l *raftLog) matches(prevIndex Index, prevTerm Term) bool {
-	if prevIndex == 0 {
-		return true
-	}
 	if prevIndex > l.lastIndex() {
 		return false
 	}
 	return l.termAt(prevIndex) == prevTerm
 }
 
-// append adds entries to the end of the log. Each entry's Index must equal
-// the current lastIndex + 1; a violation is a programming error.
+// append adds deep copies of entries to the end of the log (the log owns its
+// Command bytes). Each entry's Index must equal the current lastIndex + 1; a
+// violation is a programming error.
 func (l *raftLog) append(entries ...LogEntry) {
-	for _, e := range entries {
+	for _, e := range CloneEntries(entries) {
 		if e.Index != l.lastIndex()+1 {
 			panic(fmt.Sprintf("raft: append index %d, want %d", e.Index, l.lastIndex()+1))
 		}

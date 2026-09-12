@@ -12,7 +12,7 @@ import (
 // implements. It exists so the skeleton compiles and is testable now.
 var ErrNotImplemented = errors.New("raft: not implemented")
 
-// Config configures a Node. All fields except Rand and Logger are required.
+// Config configures a Node. All fields except Logger are required.
 type Config struct {
 	// ID is this node's identity.
 	ID NodeID
@@ -24,10 +24,14 @@ type Config struct {
 	ElectionTimeoutMin time.Duration
 	ElectionTimeoutMax time.Duration
 	// HeartbeatInterval is how often a Leader sends empty AppendEntries. It
-	// must be much smaller than ElectionTimeoutMin.
+	// must be smaller than ElectionTimeoutMin (ideally by an order of
+	// magnitude), otherwise followers time out between heartbeats.
 	HeartbeatInterval time.Duration
-	// Rand is the only source of randomness the core uses, so that a seeded
-	// Rand makes the node deterministic. Defaults to a fixed-seed source.
+	// Rand is the only source of randomness the core uses (election timeouts).
+	// It is required and has no default: a deterministic host seeds it
+	// explicitly, and a fixed default would give every node the same timeout
+	// sequence, which defeats randomized elections. Nodes in one process may
+	// share a single *rand.Rand as long as one goroutine drives them.
 	Rand *rand.Rand
 	// Logger receives structured diagnostic events. Defaults to slog.Default.
 	// Protocol behavior never depends on logging.
@@ -42,9 +46,16 @@ func (c *Config) validate() error {
 		return fmt.Errorf("raft: invalid election timeout range [%v, %v]", c.ElectionTimeoutMin, c.ElectionTimeoutMax)
 	case c.HeartbeatInterval <= 0:
 		return errors.New("raft: Config.HeartbeatInterval must be positive")
+	case c.HeartbeatInterval >= c.ElectionTimeoutMin:
+		return fmt.Errorf("raft: HeartbeatInterval %v must be smaller than ElectionTimeoutMin %v", c.HeartbeatInterval, c.ElectionTimeoutMin)
+	case c.Rand == nil:
+		return errors.New("raft: Config.Rand is required")
 	}
 	seen := map[NodeID]bool{c.ID: true}
 	for _, p := range c.Peers {
+		if p == None {
+			return errors.New("raft: Config.Peers contains an empty NodeID")
+		}
 		if seen[p] {
 			return fmt.Errorf("raft: duplicate or self peer %q", p)
 		}
@@ -100,8 +111,11 @@ func NewNode(cfg Config, storage Storage, sm StateMachine) (*Node, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	if cfg.Rand == nil {
-		cfg.Rand = rand.New(rand.NewSource(1))
+	if storage == nil {
+		return nil, errors.New("raft: storage is required")
+	}
+	if sm == nil {
+		return nil, errors.New("raft: state machine is required")
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -126,7 +140,7 @@ func NewNode(cfg Config, storage Storage, sm StateMachine) (*Node, error) {
 		role:        Follower,
 		currentTerm: state.CurrentTerm,
 		votedFor:    state.VotedFor,
-		log:         raftLog{entries: append([]LogEntry(nil), state.Entries...)},
+		log:         raftLog{entries: CloneEntries(state.Entries)},
 		nextIndex:   make(map[NodeID]Index, len(peers)),
 		matchIndex:  make(map[NodeID]Index, len(peers)),
 	}

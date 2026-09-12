@@ -40,7 +40,7 @@ func (m *MemoryStorage) Load() (raft.PersistentState, error) {
 	return raft.PersistentState{
 		CurrentTerm: m.term,
 		VotedFor:    m.votedFor,
-		Entries:     append([]raft.LogEntry(nil), m.entries...),
+		Entries:     raft.CloneEntries(m.entries),
 	}, nil
 }
 
@@ -62,12 +62,14 @@ func (m *MemoryStorage) AppendEntries(entries []raft.LogEntry) error {
 	if m.closed {
 		return ErrClosed
 	}
-	for _, e := range entries {
-		if want := raft.Index(len(m.entries) + 1); e.Index != want {
+	// Validate the whole batch before touching m.entries so that a rejected
+	// call leaves the store exactly as it was (all-or-nothing).
+	for i, e := range entries {
+		if want := raft.Index(len(m.entries) + i + 1); e.Index != want {
 			return fmt.Errorf("storage: append index %d, want %d", e.Index, want)
 		}
-		m.entries = append(m.entries, e)
 	}
+	m.entries = append(m.entries, raft.CloneEntries(entries)...)
 	return nil
 }
 
