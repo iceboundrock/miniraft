@@ -1,0 +1,79 @@
+package raft
+
+import (
+	"io"
+	"log/slog"
+	"math/rand"
+	"testing"
+	"time"
+)
+
+// testConfig returns a Config with deterministic randomness and quiet logging.
+func testConfig(id NodeID, peers ...NodeID) Config {
+	return Config{
+		ID:                 id,
+		Peers:              peers,
+		ElectionTimeoutMin: 150 * time.Millisecond,
+		ElectionTimeoutMax: 300 * time.Millisecond,
+		HeartbeatInterval:  50 * time.Millisecond,
+		Rand:               rand.New(rand.NewSource(1)),
+		Logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+}
+
+// memStorage is a minimal in-package raft.Storage so that raft tests do not
+// import internal/storage (which imports raft). It is intentionally tiny.
+type memStorage struct {
+	state PersistentState
+}
+
+func (m *memStorage) Load() (PersistentState, error) {
+	s := m.state
+	s.Entries = append([]LogEntry(nil), m.state.Entries...)
+	return s, nil
+}
+
+func (m *memStorage) SaveTermVote(term Term, votedFor NodeID) error {
+	m.state.CurrentTerm, m.state.VotedFor = term, votedFor
+	return nil
+}
+
+func (m *memStorage) AppendEntries(entries []LogEntry) error {
+	m.state.Entries = append(m.state.Entries, entries...)
+	return nil
+}
+
+func (m *memStorage) TruncateSuffix(from Index) error {
+	if from == 0 {
+		m.state.Entries = nil
+	} else if from <= Index(len(m.state.Entries)) {
+		m.state.Entries = m.state.Entries[:from-1]
+	}
+	return nil
+}
+
+func (m *memStorage) Close() error { return nil }
+
+// nopSM is a StateMachine that records nothing.
+type nopSM struct{}
+
+func (nopSM) Apply(LogEntry) ([]byte, error) { return nil, nil }
+
+// newTestNode builds a node over the given storage, failing the test on error.
+func newTestNode(t *testing.T, cfg Config, st Storage) *Node {
+	t.Helper()
+	n, err := NewNode(cfg, st, nopSM{})
+	if err != nil {
+		t.Fatalf("NewNode: %v", err)
+	}
+	return n
+}
+
+// entries builds a log from (index, term) pairs with a synthetic command.
+func entries(pairs ...[2]uint64) []LogEntry {
+	out := make([]LogEntry, 0, len(pairs))
+	for _, p := range pairs {
+		out = append(out, LogEntry{Index: Index(p[0]), Term: Term(p[1]), Command: []byte{byte(p[0])}})
+	}
+	return out
+}
