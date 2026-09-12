@@ -105,3 +105,23 @@ func TestRaftLogAppendGapPanics(t *testing.T) {
 	var l raftLog
 	l.append(LogEntry{Index: 2, Term: 1})
 }
+
+func TestRaftLogEntryAtCopiesCommand(t *testing.T) {
+	var l raftLog
+	l.append(entries([2]uint64{1, 1})...)
+	e := l.entryAt(1)
+	e.Command[0] = 0xff
+	if l.entryAt(1).Command[0] != 1 {
+		t.Fatal("entryAt must not share Command bytes with the log")
+	}
+}
+
+func TestRaftLogAppendTermZeroPanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("append of a term-0 entry must panic")
+		}
+	}()
+	var l raftLog
+	l.append(LogEntry{Index: 1, Term: 0})
+}

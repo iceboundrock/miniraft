@@ -99,3 +99,14 @@ func TestMemoryStorageAppendIsAtomic(t *testing.T) {
 		t.Fatalf("partial append: store has %d entries, want 0", len(s.Entries))
 	}
 }
+
+func TestMemoryStorageRejectsTermZeroEntry(t *testing.T) {
+	st := NewMemoryStorage()
+	if err := st.AppendEntries(entries([2]uint64{1, 1}, [2]uint64{2, 0})); err == nil {
+		t.Fatal("AppendEntries accepted a real entry with term 0")
+	}
+	// The rejection must be all-or-nothing like the index check.
+	if s, _ := st.Load(); len(s.Entries) != 0 {
+		t.Fatalf("partial append: store has %d entries, want 0", len(s.Entries))
+	}
+}

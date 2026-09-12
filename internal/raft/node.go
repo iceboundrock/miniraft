@@ -124,10 +124,8 @@ func NewNode(cfg Config, storage Storage, sm StateMachine) (*Node, error) {
 	if err != nil {
 		return nil, fmt.Errorf("raft: load persistent state: %w", err)
 	}
-	for i, e := range state.Entries {
-		if e.Index != Index(i+1) {
-			return nil, fmt.Errorf("raft: loaded entry %d has index %d", i, e.Index)
-		}
+	if err := ValidateEntries(state.Entries, 1); err != nil {
+		return nil, fmt.Errorf("raft: load persistent state: %w", err)
 	}
 	peers := append([]NodeID(nil), cfg.Peers...)
 	n := &Node{

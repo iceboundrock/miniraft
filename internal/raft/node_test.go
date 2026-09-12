@@ -97,3 +97,10 @@ func TestProtocolEntryPointsNotImplemented(t *testing.T) {
 		t.Errorf("Step must reject a malformed message before anything else, got %v", err)
 	}
 }
+
+func TestNewNodeRejectsTermZeroEntry(t *testing.T) {
+	st := &memStorage{state: PersistentState{Entries: entries([2]uint64{1, 1}, [2]uint64{2, 0})}}
+	if _, err := NewNode(testConfig("a"), st, nopSM{}); err == nil {
+		t.Fatal("NewNode accepted a real entry with term 0")
+	}
+}

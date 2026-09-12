@@ -42,10 +42,8 @@ func (m *memStorage) SaveTermVote(term Term, votedFor NodeID) error {
 }
 
 func (m *memStorage) AppendEntries(entries []LogEntry) error {
-	for i, e := range entries {
-		if want := Index(len(m.state.Entries) + i + 1); e.Index != want {
-			return fmt.Errorf("memStorage: append index %d, want %d", e.Index, want)
-		}
+	if err := ValidateEntries(entries, Index(len(m.state.Entries)+1)); err != nil {
+		return fmt.Errorf("memStorage: append: %w", err)
 	}
 	m.state.Entries = append(m.state.Entries, CloneEntries(entries)...)
 	return nil

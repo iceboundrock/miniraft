@@ -1,6 +1,6 @@
 package raft
 
-import "fmt"
+import "bytes"
 
 // raftLog is the in-memory view of the replicated log. Entries are stored
 // contiguously starting at Index 1; entries[i] has Index i+1. Index 0 is the
@@ -34,9 +34,13 @@ func (l *raftLog) termAt(i Index) Term {
 	return l.entries[i-1].Term
 }
 
-// entryAt returns the entry at i (1 <= i <= lastIndex).
+// entryAt returns a deep copy of the entry at i (1 <= i <= lastIndex). The
+// copy matters because this is what gets handed to StateMachine.Apply: the
+// state machine must not be able to alter the log's Command bytes.
 func (l *raftLog) entryAt(i Index) LogEntry {
-	return l.entries[i-1]
+	e := l.entries[i-1]
+	e.Command = bytes.Clone(e.Command)
+	return e
 }
 
 // entriesFrom returns a deep copy of all entries with Index >= from (see
@@ -65,15 +69,14 @@ func (l *raftLog) matches(prevIndex Index, prevTerm Term) bool {
 }
 
 // append adds deep copies of entries to the end of the log (the log owns its
-// Command bytes). Each entry's Index must equal the current lastIndex + 1; a
-// violation is a programming error.
+// Command bytes). The entries must be a well-formed suffix starting at
+// lastIndex + 1 (see ValidateEntries); a violation is a programming error
+// because every ingress validates before reaching the log.
 func (l *raftLog) append(entries ...LogEntry) {
-	for _, e := range CloneEntries(entries) {
-		if e.Index != l.lastIndex()+1 {
-			panic(fmt.Sprintf("raft: append index %d, want %d", e.Index, l.lastIndex()+1))
-		}
-		l.entries = append(l.entries, e)
+	if err := ValidateEntries(entries, l.lastIndex()+1); err != nil {
+		panic(err)
 	}
+	l.entries = append(l.entries, CloneEntries(entries)...)
 }
 
 // truncateSuffix deletes every entry with Index >= from. Truncating beyond

@@ -60,6 +60,11 @@ func (r Role) String() string {
 
 // LogEntry is one entry in the replicated log.
 //
+// A real entry always has Index >= 1 and Term >= 1: index 0 / term 0 are the
+// sentinels for "before the first entry", and an entry can only be created by
+// a Leader, which implies an election in a term >= 1. ValidateEntries
+// enforces this wherever entries enter a log.
+//
 // Command is replicated state-machine input and must never change once the
 // entry is in a log. Every log boundary (raftLog, Storage, outgoing messages)
 // therefore deep-copies entries with CloneEntries so that a caller mutating
@@ -81,6 +86,23 @@ func CloneEntries(entries []LogEntry) []LogEntry {
 		out[i] = LogEntry{Index: e.Index, Term: e.Term, Command: bytes.Clone(e.Command)}
 	}
 	return out
+}
+
+// ValidateEntries reports whether entries form a well-formed log suffix
+// starting at index first: indexes are contiguous from first and every term is
+// non-zero. It is the single definition of "acceptable entries" shared by the
+// log, Storage implementations and AppendEntries validation, so that a
+// malformed batch is rejected at whichever boundary it arrives.
+func ValidateEntries(entries []LogEntry, first Index) error {
+	for i, e := range entries {
+		if want := first + Index(i); e.Index != want {
+			return fmt.Errorf("raft: entry %d has index %d, want %d", i, e.Index, want)
+		}
+		if e.Term == 0 {
+			return fmt.Errorf("raft: entry at index %d has term 0 (reserved for the sentinel)", e.Index)
+		}
+	}
+	return nil
 }
 
 // RequestVote is the RequestVote RPC request (Figure 2). It is sent by a
@@ -192,8 +214,10 @@ func (m Message) Term() Term {
 	return 0
 }
 
-// Validate reports whether the envelope is well formed: Type is known and the
-// matching payload (and only that payload) is set.
+// Validate reports whether the envelope is well formed: Type is known, the
+// matching payload (and only that payload) is set, and an AppendEntries
+// payload carries a well-formed suffix that follows PrevLogIndex (see
+// ValidateEntries).
 func (m Message) Validate() error {
 	set := 0
 	var want bool
@@ -220,6 +244,11 @@ func (m Message) Validate() error {
 		return fmt.Errorf("raft: message %s carries %d payloads, want 1", m.Type, set)
 	case !want:
 		return fmt.Errorf("raft: message type %s does not match its payload", m.Type)
+	}
+	if ae := m.AppendEntries; ae != nil {
+		if err := ValidateEntries(ae.Entries, ae.PrevLogIndex+1); err != nil {
+			return fmt.Errorf("raft: AppendEntries payload: %w", err)
+		}
 	}
 	return nil
 }

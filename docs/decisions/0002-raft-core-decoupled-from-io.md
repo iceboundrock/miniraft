@@ -33,7 +33,8 @@ Time appears only as durations inside `ResetElectionTimer` /
 simulator (issue #3) and `time.Timer` in the real runtime, and neither is
 visible to `raft`. Log entries are deep-copied at every core boundary
 (`raft.CloneEntries`) so hosts and storage never share `Command` bytes with
-the log.
+the log, and validated at every ingress (`raft.ValidateEntries`: contiguous
+indexes, non-zero terms) so a malformed entry can never reach a log.
 
 Storage is invoked synchronously inside the core. Because actions are executed
 only after the core returns, everything written to storage while handling an

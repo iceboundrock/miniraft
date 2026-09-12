@@ -64,10 +64,8 @@ func (m *MemoryStorage) AppendEntries(entries []raft.LogEntry) error {
 	}
 	// Validate the whole batch before touching m.entries so that a rejected
 	// call leaves the store exactly as it was (all-or-nothing).
-	for i, e := range entries {
-		if want := raft.Index(len(m.entries) + i + 1); e.Index != want {
-			return fmt.Errorf("storage: append index %d, want %d", e.Index, want)
-		}
+	if err := raft.ValidateEntries(entries, raft.Index(len(m.entries)+1)); err != nil {
+		return fmt.Errorf("storage: append: %w", err)
 	}
 	m.entries = append(m.entries, raft.CloneEntries(entries)...)
 	return nil

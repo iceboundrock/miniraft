@@ -25,8 +25,9 @@ type Storage interface {
 	// SaveTermVote durably records currentTerm and votedFor together. They are
 	// always written as a pair because a vote is only meaningful in its term.
 	SaveTermVote(term Term, votedFor NodeID) error
-	// AppendEntries durably appends entries, which must be contiguous and
-	// start at the current last index + 1. The call is all-or-nothing: on
+	// AppendEntries durably appends entries, which must be a well-formed
+	// suffix starting at the current last index + 1 (see ValidateEntries:
+	// contiguous indexes, non-zero terms). The call is all-or-nothing: on
 	// error the stored log is unchanged.
 	AppendEntries(entries []LogEntry) error
 	// TruncateSuffix durably deletes every entry with Index >= fromIndex.
