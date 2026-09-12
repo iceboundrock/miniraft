@@ -61,7 +61,7 @@ cmd/raftctl/            client CLI (later issue)
 internal/raft/          Raft core: types, log, node, actions
 internal/storage/       Storage implementations (MemoryStorage now, FileStorage later)
 internal/statemachine/  State machine implementations (KV later)
-internal/simulator/     deterministic simulator (later issue)
+internal/simulator/     deterministic simulator: fake clock, event queue, network, cluster harness
 internal/transport/     real transport (HTTP, later issue)
 docs/decisions/         architecture decision records
 ```
@@ -82,6 +82,41 @@ go vet ./...
 
 The module uses only the Go standard library; `go list -m all` should print the
 module name alone.
+
+### Deterministic simulation
+
+`internal/simulator` runs a whole cluster in one goroutine on a fake clock, so
+every test is reproducible from its seed. Its pieces:
+
+- `EventQueue` — min-heap ordered by `(At, Seq)`; ties break by creation order.
+- `Clock` — `Now()`, `Advance(d)`, `After(d, fn) TimerID`, `Stop(id)`.
+- `Network` — per-node inboxes; `Send` schedules delivery after a fixed or
+  seeded-random latency. Faults: `Drop`, `Disconnect`/`Reconnect` (directional),
+  `Isolate`, `Partition`/`Heal`, and an off-by-default `SetDuplicate` hook.
+  Link policy is checked at send *and* at delivery, so messages already in
+  flight are lost when a partition or disconnect appears.
+- `Cluster` — hosts N `*raft.Node`s over `MemoryStorage`, translates the
+  `Action`s they return into timers and sends, and drives everything with
+  `Run(until)`, `Step()` or `RunUntil(pred, maxTime)`.
+
+Every event is logged on a timeline stamped with the fake clock:
+
+```
+t=0 event=cluster seed=1 nodes=3
+t=150 event=ElectionTimeout node=a
+t=152 event=send from=a to=b type=RequestVote term=1 latency=5ms
+t=157 event=deliver from=a to=b type=RequestVote term=1
+```
+
+Every simulator test logs `seed=<n>`. To replay a failure, construct the
+cluster with the same `Config.Seed` (or set it in the test) and run it again:
+
+```sh
+go test ./internal/simulator/ -run TestDeterministicReplay -v
+```
+
+Out of scope until later issues: node crash/restart, message reordering and
+random drop rates, and the invariant checker.
 
 Work is tracked in the [EPIC issue](https://github.com/iceboundrock/miniraft/issues/1);
 one branch and one pull request per child issue.
