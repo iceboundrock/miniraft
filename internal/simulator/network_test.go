@@ -2,6 +2,7 @@ package simulator
 
 import (
 	"bytes"
+	"math"
 	"math/rand"
 	"strings"
 	"testing"
@@ -91,6 +92,9 @@ func TestNetworkDeliversWithLatency(t *testing.T) {
 	tn.net.Send(vote("a", "b", 1))
 	tn.net.Send(vote("a", "b", 2))
 	tn.net.Send(vote("a", "b", 3))
+	if tn.clock.Pending() != 3 {
+		t.Fatalf("Pending() = %d, want 3: in-flight messages are clock events", tn.clock.Pending())
+	}
 
 	tn.clock.Advance(9 * time.Millisecond)
 	assertTerms(t, tn.nodes["b"])
@@ -336,6 +340,19 @@ func TestNetworkUnknownRecipientIsDropped(t *testing.T) {
 	tn.clock.Advance(time.Millisecond)
 	if !strings.Contains(tn.log.String(), "reason=no-handler") {
 		t.Fatalf("timeline missing no-handler drop:\n%s", tn.log.String())
+	}
+}
+
+// TestNetworkWidestLatencyRange: [0, MaxInt64] is a valid range and must not
+// overflow when the span is widened by one for inclusive sampling.
+func TestNetworkWidestLatencyRange(t *testing.T) {
+	cfg := NetworkConfig{MinLatency: 0, MaxLatency: time.Duration(math.MaxInt64)}
+	tn := newTestNetwork(t, 1, cfg, "a", "b")
+	for i := 0; i < 10; i++ {
+		tn.net.Send(vote("a", "b", raft.Term(i+1)))
+	}
+	if d, ok := tn.clock.NextDeadline(); !ok || d < 0 {
+		t.Fatalf("NextDeadline() = %v, %v; want a non-negative deadline", d, ok)
 	}
 }
 

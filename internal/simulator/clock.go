@@ -89,7 +89,12 @@ func (c *Clock) NextDeadline() (time.Duration, bool) {
 	return ev.At, true
 }
 
-// Pending returns the number of armed, not-yet-fired timers.
+// Pending returns the number of pending events: every After call that has
+// neither fired nor been stopped. The Clock does not know what an event is
+// for, and the Network schedules message deliveries through After too, so a
+// node with one election timer and three messages in flight has Pending() ==
+// 4. Ask SimNode.ElectionTimerArmed / HeartbeatTimerArmed about Raft timers;
+// use Pending() == 0 to detect a quiescent simulation.
 func (c *Clock) Pending() int { return c.queue.Len() }
 
 // fire pops and runs the earliest event. The queue is ordered and Now() never

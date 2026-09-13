@@ -3,6 +3,7 @@ package simulator
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"math/rand"
 	"time"
 
@@ -131,13 +132,18 @@ func (n *Network) deliver(msg raft.Message, log *slog.Logger) {
 	h.HandleMessage(msg)
 }
 
-// latency draws one message latency from [MinLatency, MaxLatency].
+// latency draws one message latency uniformly from [MinLatency, MaxLatency].
 func (n *Network) latency() time.Duration {
-	span := n.cfg.MaxLatency - n.cfg.MinLatency
-	if span == 0 {
+	span := int64(n.cfg.MaxLatency - n.cfg.MinLatency)
+	switch {
+	case span == 0:
 		return n.cfg.MinLatency
+	case span == math.MaxInt64:
+		// span+1 would overflow; Int63 already covers [0, MaxInt64].
+		return n.cfg.MinLatency + time.Duration(n.rng.Int63())
+	default:
+		return n.cfg.MinLatency + time.Duration(n.rng.Int63n(span+1))
 	}
-	return n.cfg.MinLatency + time.Duration(n.rng.Int63n(int64(span)+1))
 }
 
 // Connected reports whether a message from -> to would currently be
