@@ -117,8 +117,11 @@ cluster with the same `Config.Seed` (or set it in the test) and run it again:
 go test ./internal/simulator/ -run TestDeterministicReplay -v
 ```
 
-Out of scope until later issues: node crash/restart, message reordering and
-random drop rates, and the invariant checker.
+Messages already reorder under a random latency range: a later message with
+a shorter latency arrives first, and `TestDeterministicReplay` relies on
+that. Out of scope until later issues: node crash/restart, explicit fault
+policies (random drop, duplication and reorder rates), and the invariant
+checker.
 
 Work is tracked in the [EPIC issue](https://github.com/iceboundrock/miniraft/issues/1);
 one branch and one pull request per child issue.
