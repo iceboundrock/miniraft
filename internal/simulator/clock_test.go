@@ -1,6 +1,7 @@
 package simulator
 
 import (
+	"math"
 	"slices"
 	"testing"
 	"time"
@@ -148,6 +149,30 @@ func TestClockRejectsNegativeDurations(t *testing.T) {
 	c := NewClock()
 	assertPanics(t, "After(-1)", func() { c.After(-time.Millisecond, func() {}) })
 	assertPanics(t, "Advance(-1)", func() { c.Advance(-time.Millisecond) })
+}
+
+// TestClockRejectsOverflow: a deadline past the end of logical time would
+// wrap negative and let fire() move the clock backwards, so After and Advance
+// refuse it and leave the clock untouched. The exact end of time is allowed.
+func TestClockRejectsOverflow(t *testing.T) {
+	c := NewClock()
+	c.Advance(time.Millisecond)
+	assertPanics(t, "After(MaxInt64)", func() { c.After(time.Duration(math.MaxInt64), func() {}) })
+	assertPanics(t, "Advance(MaxInt64)", func() { c.Advance(time.Duration(math.MaxInt64)) })
+	if c.Now() != time.Millisecond || c.Pending() != 0 {
+		t.Fatalf("Now() = %v, Pending() = %d after rejected calls; want 1ms, 0", c.Now(), c.Pending())
+	}
+
+	end := time.Duration(math.MaxInt64)
+	fired := false
+	c.After(end-c.Now(), func() { fired = true })
+	if d, _ := c.NextDeadline(); d != end {
+		t.Fatalf("NextDeadline() = %v, want %v", d, end)
+	}
+	c.Advance(end - c.Now())
+	if !fired || c.Now() != end {
+		t.Fatalf("fired = %v, Now() = %v; want true, %v", fired, c.Now(), end)
+	}
 }
 
 func assertPanics(t *testing.T, name string, fn func()) {

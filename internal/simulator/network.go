@@ -19,7 +19,9 @@ type Handler interface {
 // NetworkConfig sets the base latency of every link. MinLatency == MaxLatency
 // gives a fixed latency and therefore FIFO delivery per link; a wider range
 // draws each message's latency from the cluster's seeded random source, which
-// is also the only way messages get reordered in this issue.
+// is also the only way messages get reordered in this issue. Latencies are
+// added to the clock, so a range reaching toward math.MaxInt64 is accepted here
+// but makes Clock.After panic once Now()+latency would overflow logical time.
 type NetworkConfig struct {
 	MinLatency time.Duration
 	MaxLatency time.Duration
