@@ -40,9 +40,10 @@ Raft Node (internal/raft) — pure, event-driven: Event -> state transition -> [
    +---- State Machine  (internal/statemachine) replicated KV
 ```
 
-The Raft core owns no goroutines, timers, sockets or files. A *host* feeds it
-events (`Step(msg)`, `ElectionTimeout()`, `HeartbeatTimeout()`, `Propose(cmd)`)
-and executes the `Action`s it returns (`SendMessage`, `ResetElectionTimer`,
+The Raft core owns no goroutines, timers, sockets or files. A *host* arms the
+first election timer with `Start()`, then feeds it events (`Step(msg)`,
+`ElectionTimeout()`, `HeartbeatTimeout()`, `Propose(cmd)`) and executes the
+`Action`s it returns (`SendMessage`, `ResetElectionTimer`,
 `ResetHeartbeatTimer`, `Applied`, ...). In tests the host is a single-threaded
 deterministic simulator; in production it is a real-time event loop.
 
@@ -71,6 +72,50 @@ docs/decisions/         architecture decision records
 | Persistent (via `Storage`) | Volatile | Leader-only volatile |
 |---|---|---|
 | `currentTerm`, `votedFor`, `log[]` | `commitIndex`, `lastApplied` | `nextIndex[]`, `matchIndex[]` |
+
+### Leader election
+
+`internal/raft/election.go` implements §5.2 and the election restriction of
+§5.4.1. The flow, with the persistence points marked:
+
+```
+Follower ──ElectionTimeout──▶ Candidate: term+1, votedFor=self  [SaveTermVote]
+                                  │  RequestVote(term, lastLogIndex, lastLogTerm) → every peer
+                                  │  ResetElectionTimer(random)
+   voter: grant iff term == currentTerm
+          && votedFor ∈ {none, candidate}
+          && candidate log up-to-date          [SaveTermVote before replying]
+                                  │
+        majority of RequestVoteResponse{granted} ──▶ Leader: nextIndex/matchIndex reset,
+                                                             StopElectionTimer, ResetHeartbeatTimer
+        any message with a higher term ──▶ Follower in that term, votedFor=none  [SaveTermVote]
+```
+
+Rules worth knowing because they are easy to get subtly wrong:
+
+- **Log up-to-date** (`candidateLogUpToDate`): compare the last log *term*
+  first; only equal terms compare the index. A longer log with an older last
+  term loses.
+- **One vote per term**: `votedFor` is persisted before the response is
+  produced, so a crash between the two cannot lead to a second vote.
+- **Vote tally is a set** keyed by voter, so a duplicated response cannot
+  count twice.
+- **Election timer resets** happen only when a node starts an election,
+  grants a vote, or (from issue #6) hears from the current Leader. A *denied*
+  `RequestVote` never resets the timer, even when it carried a higher term —
+  otherwise a node with a stale log could keep the cluster from electing
+  anyone. The one exception is a Leader stepping down: it has no election
+  timer running (it was stopped on election), so `becomeFollower` arms one
+  and stops the heartbeat timer.
+- **Terms never decrease**: `becomeFollower(term)` panics on a lower term.
+- **Storage first**: `currentTerm`/`votedFor` are written before the
+  in-memory copies change; a storage error leaves the node untouched and
+  produces no actions.
+
+Heartbeats are not sent yet (issue #6), so a Leader does not suppress its
+followers' election timers and `HeartbeatTimeout()` still reports
+`ErrNotImplemented`. Simulator tests therefore stop the clock once the
+election under test has completed; multi-round election runs are issue #17.
 
 ### Persistence
 
@@ -117,17 +162,36 @@ every test is reproducible from its seed. Its pieces:
   flight are lost when a partition or disconnect appears. Every scheduled
   delivery carries its own deep copy of the message, as serialization would
   on a real transport.
-- `Cluster` — hosts N `*raft.Node`s over `MemoryStorage`, translates the
-  `Action`s they return into timers and sends, and drives everything with
-  `Run(until)`, `Step()` or `RunUntil(pred, maxTime)`.
+- `Cluster` — hosts N `*raft.Node`s over `MemoryStorage` (or stores
+  pre-loaded through `Config.Stores`), arms their first election timers via
+  `Start()`, translates the `Action`s they return into timers and sends, and
+  drives everything with `Run(until)`, `Step()` or `RunUntil(pred, maxTime)`.
+  `Leader()` returns the unique Leader of the highest term, `Roles()` every
+  node's role, and `SimNode.ForceElectionTimeout()` makes a node start an
+  election right now (how the split-vote test creates two simultaneous
+  candidates by construction rather than by seed hunting).
+- **Invariant checker** — after every core input the cluster observes every
+  node's `Status()` and records violations of Election Safety (at most one
+  Leader per term over the whole run), Term Monotonicity (a node's term never
+  decreases) and Vote Safety (a node never changes its vote within a term).
+  `AssertInvariants()` returns them; the test helper calls it at the end of
+  every simulator test.
 
-Every event is logged on a timeline stamped with the fake clock:
+Every event is logged on a timeline stamped with the fake clock (excerpt of
+a three-node election under seed 1):
 
 ```
 t=0 event=cluster seed=1 nodes=3
-t=150 event=ElectionTimeout node=a
-t=152 event=send from=a to=b type=RequestVote term=1 latency=5ms
-t=157 event=deliver from=a to=b type=RequestVote term=1
+t=0 event=ResetElectionTimer node=c timeout=152.915349ms
+t=152 event=ElectionTimeout node=c term=0 role=Follower
+t=152 event=BecameCandidate node=c term=1 role=Candidate
+t=152 event=send from=c to=b type=RequestVote term=1 latency=15.942972ms
+t=168 event=deliver from=c to=b type=RequestVote term=1
+t=168 event=TermAdvanced node=b term=1 role=Follower
+t=168 event=VoteGranted node=b term=1 role=Follower peer=c
+t=178 event=BecameLeader node=c term=1 role=Leader
+t=178 event=StopElectionTimer node=c
+t=178 event=ResetHeartbeatTimer node=c interval=50ms
 ```
 
 Every test that builds a `Cluster` or a `Network` logs `seed=<n>` (the
@@ -141,9 +205,8 @@ go test ./internal/simulator/ -run TestDeterministicReplay -v
 
 Messages already reorder under a random latency range: a later message with
 a shorter latency arrives first, and `TestDeterministicReplay` relies on
-that. Out of scope until later issues: node crash/restart, explicit fault
-policies (random drop, duplication and reorder rates), and the invariant
-checker.
+that. Out of scope until later issues: node crash/restart and explicit fault
+policies (random drop, duplication and reorder rates).
 
 Work is tracked in the [EPIC issue](https://github.com/iceboundrock/miniraft/issues/1);
 one branch and one pull request per child issue.

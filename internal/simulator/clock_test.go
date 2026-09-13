@@ -214,3 +214,24 @@ func assertPanics(t *testing.T, name string, fn func()) {
 	}()
 	fn()
 }
+
+func TestClockDeadline(t *testing.T) {
+	c := NewClock()
+	c.Advance(5 * time.Millisecond)
+	id := c.After(10*time.Millisecond, func() {})
+	if at, ok := c.Deadline(id); !ok || at != 15*time.Millisecond {
+		t.Fatalf("Deadline = %v,%v; want 15ms,true", at, ok)
+	}
+	if _, ok := c.Deadline(0); ok {
+		t.Fatal("Deadline(0) must report no timer")
+	}
+	c.Stop(id)
+	if _, ok := c.Deadline(id); ok {
+		t.Fatal("Deadline of a stopped timer must report no timer")
+	}
+	id = c.After(time.Millisecond, func() {})
+	c.Step()
+	if _, ok := c.Deadline(id); ok {
+		t.Fatal("Deadline of a fired timer must report no timer")
+	}
+}

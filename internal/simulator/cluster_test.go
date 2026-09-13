@@ -2,6 +2,7 @@ package simulator
 
 import (
 	"errors"
+	"maps"
 	"math"
 	"slices"
 	"strings"
@@ -9,12 +10,15 @@ import (
 	"time"
 
 	"github.com/iceboundrock/miniraft/internal/raft"
+	"github.com/iceboundrock/miniraft/internal/storage"
 )
 
 // fakeCore is a scripted Core: it records every input and returns the
 // actions the test configured.
 type fakeCore struct {
 	id                raft.NodeID
+	status            raft.Status // returned by Status (ID is filled in)
+	starts            int
 	steps             []raft.Message
 	electionTimeouts  int
 	heartbeatTimeouts int
@@ -50,7 +54,16 @@ func (f *fakeCore) Propose(cmd []byte) ([]raft.Action, error) {
 	return nil, f.err
 }
 
-func (f *fakeCore) Status() raft.Status { return raft.Status{ID: f.id} }
+func (f *fakeCore) Start() []raft.Action {
+	f.starts++
+	return nil
+}
+
+func (f *fakeCore) Status() raft.Status {
+	st := f.status
+	st.ID = f.id
+	return st
+}
 
 // TestClusterTranslatesActions drives SimNode.Execute with a hand-written
 // action list and checks each action's effect on the clock and network.
@@ -147,8 +160,7 @@ func TestClusterRecordsCoreErrors(t *testing.T) {
 }
 
 // TestClusterHostsRaftNodes: NewCluster builds real raft.Nodes over
-// MemoryStorage. Their protocol entry points are stubs in this issue, so a
-// fired timer reaches the core and its ErrNotImplemented is recorded.
+// MemoryStorage and arms each node's first election timer via Start().
 func TestClusterHostsRaftNodes(t *testing.T) {
 	c := newTestCluster(t, Config{Seed: 1, NodeIDs: []raft.NodeID{"c", "a", "b"}})
 	nodes := c.Nodes()
@@ -162,6 +174,11 @@ func TestClusterHostsRaftNodes(t *testing.T) {
 		if n.Storage == nil {
 			t.Fatalf("node %s has no MemoryStorage", n.ID())
 		}
+		at, ok := n.ElectionDeadline()
+		if !n.ElectionTimerArmed() || !ok || at < DefaultElectionTimeoutMin || at > DefaultElectionTimeoutMax {
+			t.Fatalf("node %s: election timer armed=%v deadline=%v,%v; want a deadline in [%v, %v]",
+				n.ID(), n.ElectionTimerArmed(), at, ok, DefaultElectionTimeoutMin, DefaultElectionTimeoutMax)
+		}
 	}
 	if !slices.Equal(ids, []raft.NodeID{"a", "b", "c"}) {
 		t.Fatalf("Nodes() order = %v, want sorted", ids)
@@ -169,16 +186,175 @@ func TestClusterHostsRaftNodes(t *testing.T) {
 	if c.Node("zz") != nil {
 		t.Fatal("Node(unknown) must be nil")
 	}
-
-	c.Node("a").Execute([]raft.Action{raft.ResetElectionTimer{Timeout: 100 * time.Millisecond}})
-	c.Run(100 * time.Millisecond)
-	errs := c.Errors()
-	if len(errs) != 1 || !errors.Is(errs[0], raft.ErrNotImplemented) {
-		t.Fatalf("Errors() = %v, want one ErrNotImplemented", errs)
+	if c.Clock().Pending() != 3 {
+		t.Fatalf("Pending() = %d, want one election timer per node", c.Clock().Pending())
 	}
 	if c.Timeline()[0] != "t=0 event=cluster seed=1 nodes=3" {
 		t.Fatalf("first timeline line = %q", c.Timeline()[0])
 	}
+}
+
+// TestClusterUsesProvidedStores: a node listed in Config.Stores is built
+// over that store, so tests can pre-load a term, a vote or a log.
+func TestClusterUsesProvidedStores(t *testing.T) {
+	st := storage.NewMemoryStorage()
+	if err := st.SaveTermVote(3, "b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AppendEntries([]raft.LogEntry{{Index: 1, Term: 2, Command: []byte("x")}}); err != nil {
+		t.Fatal(err)
+	}
+	c := newTestCluster(t, Config{Seed: 1, NodeIDs: []raft.NodeID{"a", "b"}, Stores: map[raft.NodeID]*storage.MemoryStorage{"a": st}})
+	got := c.Node("a").Status()
+	if got.Term != 3 || got.VotedFor != "b" || got.LastLogIndex != 1 || c.Node("a").Storage != st {
+		t.Fatalf("node a status = %+v, want the pre-loaded state", got)
+	}
+	if c.Node("b").Status().Term != 0 || c.Node("b").Storage == nil {
+		t.Fatal("node b must get a fresh store")
+	}
+}
+
+func TestClusterRejectsStoreForUnknownNode(t *testing.T) {
+	_, err := NewCluster(Config{NodeIDs: []raft.NodeID{"a"}, Stores: map[raft.NodeID]*storage.MemoryStorage{"zz": storage.NewMemoryStorage()}})
+	if err == nil {
+		t.Fatal("Stores for a node that is not in NodeIDs accepted")
+	}
+}
+
+// TestForceElectionTimeout: the hook cancels the pending timer and drives
+// the core's ElectionTimeout immediately, at the current time.
+func TestForceElectionTimeout(t *testing.T) {
+	c := newTestCluster(t, Config{Seed: 1})
+	fa := &fakeCore{id: "a"}
+	a := c.AddNode("a", fa)
+	a.Execute([]raft.Action{raft.ResetElectionTimer{Timeout: 100 * time.Millisecond}})
+	c.Run(10 * time.Millisecond)
+
+	a.ForceElectionTimeout()
+	if fa.electionTimeouts != 1 || a.ElectionTimerArmed() || c.Clock().Pending() != 0 || c.Now() != 10*time.Millisecond {
+		t.Fatalf("after ForceElectionTimeout: timeouts=%d armed=%v pending=%d now=%v",
+			fa.electionTimeouts, a.ElectionTimerArmed(), c.Clock().Pending(), c.Now())
+	}
+	c.Run(200 * time.Millisecond)
+	if fa.electionTimeouts != 1 {
+		t.Fatalf("the cancelled timer still fired: timeouts=%d", fa.electionTimeouts)
+	}
+	// Without a pending timer the hook still drives the core.
+	a.ForceElectionTimeout()
+	if fa.electionTimeouts != 2 {
+		t.Fatalf("ForceElectionTimeout with no timer armed: timeouts=%d, want 2", fa.electionTimeouts)
+	}
+	if !timelineHas(c, "event=ForceElectionTimeout node=a") {
+		t.Fatal("timeline missing ForceElectionTimeout")
+	}
+}
+
+// TestClusterLeaderAndRoles: Leader() is the unique Leader of the highest
+// term; nil with no Leader or with two Leaders claiming the highest term.
+// Built with NewCluster directly: the scripted double Leader would trip
+// newTestCluster's invariant assertion.
+func TestClusterLeaderAndRoles(t *testing.T) {
+	c, err := NewCluster(Config{Seed: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fa, fb, fc := &fakeCore{id: "a"}, &fakeCore{id: "b"}, &fakeCore{id: "c"}
+	c.AddNode("a", fa)
+	c.AddNode("b", fb)
+	c.AddNode("c", fc)
+	if c.Leader() != nil {
+		t.Fatal("Leader() with no leader must be nil")
+	}
+	fa.status = raft.Status{Role: raft.Leader, Term: 1}
+	fb.status = raft.Status{Role: raft.Leader, Term: 2}
+	fc.status = raft.Status{Role: raft.Candidate, Term: 2}
+	if l := c.Leader(); l == nil || l.ID() != "b" {
+		t.Fatalf("Leader() = %v, want b (Leader of the highest term)", l)
+	}
+	want := map[raft.NodeID]raft.Role{"a": raft.Leader, "b": raft.Leader, "c": raft.Candidate}
+	if got := c.Roles(); !maps.Equal(got, want) {
+		t.Fatalf("Roles() = %v, want %v", got, want)
+	}
+	fa.status = raft.Status{Role: raft.Leader, Term: 2}
+	if c.Leader() != nil {
+		t.Fatal("Leader() with two Leaders in the highest term must be nil")
+	}
+}
+
+// TestInvariantChecker: violations are detected after every core input,
+// logged to the timeline and reported by AssertInvariants. Clusters are
+// built with NewCluster directly because newTestCluster fails the test on
+// any violation.
+func TestInvariantChecker(t *testing.T) {
+	newScripted := func(t *testing.T) (*Cluster, *fakeCore, *fakeCore) {
+		t.Helper()
+		c, err := NewCluster(Config{Seed: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fa, fb := &fakeCore{id: "a"}, &fakeCore{id: "b"}
+		c.AddNode("a", fa)
+		c.AddNode("b", fb)
+		return c, fa, fb
+	}
+	poke := func(c *Cluster) { c.Node("a").HandleMessage(vote("b", "a", 1)) }
+
+	t.Run("clean", func(t *testing.T) {
+		c, fa, fb := newScripted(t)
+		fa.status = raft.Status{Role: raft.Leader, Term: 1, VotedFor: "a"}
+		fb.status = raft.Status{Role: raft.Follower, Term: 1, VotedFor: "a"}
+		poke(c)
+		fa.status = raft.Status{Role: raft.Follower, Term: 2, VotedFor: "b"}
+		fb.status = raft.Status{Role: raft.Leader, Term: 2, VotedFor: "b"}
+		poke(c)
+		if err := c.AssertInvariants(); err != nil {
+			t.Fatalf("AssertInvariants() = %v, want nil", err)
+		}
+	})
+	t.Run("election safety", func(t *testing.T) {
+		c, fa, fb := newScripted(t)
+		fa.status = raft.Status{Role: raft.Leader, Term: 1}
+		poke(c)
+		fa.status = raft.Status{Role: raft.Follower, Term: 1}
+		fb.status = raft.Status{Role: raft.Leader, Term: 1} // a second Leader in term 1, later in time
+		poke(c)
+		err := c.AssertInvariants()
+		if err == nil || !strings.Contains(err.Error(), "Election Safety") {
+			t.Fatalf("AssertInvariants() = %v, want an Election Safety violation", err)
+		}
+		if !timelineHas(c, "event=invariant-violation") {
+			t.Fatal("violation not on the timeline")
+		}
+	})
+	t.Run("term monotonicity", func(t *testing.T) {
+		c, fa, _ := newScripted(t)
+		fa.status = raft.Status{Term: 5}
+		poke(c)
+		fa.status = raft.Status{Term: 4}
+		poke(c)
+		if err := c.AssertInvariants(); err == nil || !strings.Contains(err.Error(), "Term Monotonicity") {
+			t.Fatalf("AssertInvariants() = %v, want a Term Monotonicity violation", err)
+		}
+	})
+	t.Run("vote safety", func(t *testing.T) {
+		c, fa, _ := newScripted(t)
+		fa.status = raft.Status{Term: 1, VotedFor: "b"}
+		poke(c)
+		fa.status = raft.Status{Term: 1, VotedFor: "a"}
+		poke(c)
+		if err := c.AssertInvariants(); err == nil || !strings.Contains(err.Error(), "Vote Safety") {
+			t.Fatalf("AssertInvariants() = %v, want a Vote Safety violation", err)
+		}
+	})
+	t.Run("assert checks current state", func(t *testing.T) {
+		c, fa, fb := newScripted(t)
+		fa.status = raft.Status{Role: raft.Leader, Term: 1}
+		fb.status = raft.Status{Role: raft.Leader, Term: 1}
+		// No core input has run, so only AssertInvariants itself can see it.
+		if err := c.AssertInvariants(); err == nil {
+			t.Fatal("AssertInvariants() must check the current state, not only past observations")
+		}
+	})
 }
 
 func TestClusterRejectsInvalidConfig(t *testing.T) {

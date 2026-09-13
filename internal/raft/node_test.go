@@ -80,18 +80,15 @@ func TestNewNodeRejectsNilDependencies(t *testing.T) {
 
 func TestProtocolEntryPointsNotImplemented(t *testing.T) {
 	n := newTestNode(t, testConfig("a", "b"), &memStorage{})
-	if _, err := n.ElectionTimeout(); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("ElectionTimeout: %v", err)
-	}
 	if _, err := n.HeartbeatTimeout(); !errors.Is(err, ErrNotImplemented) {
 		t.Errorf("HeartbeatTimeout: %v", err)
 	}
 	if _, err := n.Propose([]byte("x")); !errors.Is(err, ErrNotImplemented) {
 		t.Errorf("Propose: %v", err)
 	}
-	msg := Message{From: "b", To: "a", Type: MsgRequestVote, RequestVote: &RequestVote{Term: 1, CandidateID: "b"}}
+	msg := Message{From: "b", To: "a", Type: MsgAppendEntries, AppendEntries: &AppendEntries{Term: 1, LeaderID: "b"}}
 	if _, err := n.Step(msg); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("Step: %v", err)
+		t.Errorf("Step(AppendEntries): %v", err)
 	}
 	if _, err := n.Step(Message{Type: MsgRequestVote}); err == nil || errors.Is(err, ErrNotImplemented) {
 		t.Errorf("Step must reject a malformed message before anything else, got %v", err)

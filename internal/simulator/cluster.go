@@ -40,6 +40,11 @@ type Config struct {
 	// Per-message latency range; equal values give fixed latency.
 	MinLatency time.Duration
 	MaxLatency time.Duration
+
+	// Stores optionally supplies the storage a node is built over, so a
+	// test can pre-load a term, a vote or a log. Nodes not listed get a
+	// fresh MemoryStorage. Every key must also appear in NodeIDs.
+	Stores map[raft.NodeID]*storage.MemoryStorage
 }
 
 func (cfg Config) withDefaults() Config {
@@ -70,6 +75,7 @@ type Cluster struct {
 	nodes    map[raft.NodeID]*SimNode
 	ids      []raft.NodeID // sorted; the only iteration order used
 	errs     []error
+	inv      invariants
 }
 
 // nopStateMachine stands in for the KV state machine of a later issue.
@@ -78,12 +84,9 @@ type nopStateMachine struct{}
 func (nopStateMachine) Apply(raft.LogEntry) ([]byte, error) { return nil, nil }
 
 // NewCluster builds the harness and one raft.Node per NodeID, each over a
-// fresh storage.MemoryStorage and a no-op state machine.
-//
-// No timer is armed here: the initial election timeout is chosen by the
-// core, and raft.Node has no start entry point until the election issue adds
-// one (issue #5, Start() returning the first ResetElectionTimer). Until then
-// a fresh cluster has no pending events and Run returns immediately.
+// fresh storage.MemoryStorage (or the one given in Config.Stores) and a
+// no-op state machine, and executes every node's Start actions, so a fresh
+// cluster has one election timer per node pending at time 0.
 func NewCluster(cfg Config) (*Cluster, error) {
 	cfg = cfg.withDefaults()
 	// NewNetwork panics on a bad range; a Config error belongs on this
@@ -103,6 +106,11 @@ func NewCluster(cfg Config) (*Cluster, error) {
 
 	ids := slices.Clone(cfg.NodeIDs)
 	slices.Sort(ids)
+	for id := range cfg.Stores {
+		if _, ok := slices.BinarySearch(ids, id); !ok {
+			return nil, fmt.Errorf("simulator: Stores lists node %q, which is not in NodeIDs", id)
+		}
+	}
 	for i, id := range ids {
 		// The peer filter below (p != id) would silently hide a duplicate
 		// id from raft.Config validation, so reject it here.
@@ -115,7 +123,10 @@ func NewCluster(cfg Config) (*Cluster, error) {
 				peers = append(peers, p)
 			}
 		}
-		st := storage.NewMemoryStorage()
+		st := cfg.Stores[id]
+		if st == nil {
+			st = storage.NewMemoryStorage()
+		}
 		node, err := raft.NewNode(raft.Config{
 			ID:                 id,
 			Peers:              peers,
@@ -130,6 +141,13 @@ func NewCluster(cfg Config) (*Cluster, error) {
 		}
 		c.AddNode(id, node).Storage = st
 	}
+	// Executed only once every node is registered, so that no action can
+	// address a node that does not exist yet.
+	for _, id := range c.ids {
+		n := c.nodes[id]
+		n.Execute(n.core.Start())
+	}
+	c.checkInvariants()
 	return c, nil
 }
 
@@ -184,6 +202,43 @@ func (c *Cluster) Nodes() []*SimNode {
 
 // Now returns the current simulated time.
 func (c *Cluster) Now() time.Duration { return c.clock.Now() }
+
+// Roles returns every node's current role.
+func (c *Cluster) Roles() map[raft.NodeID]raft.Role {
+	out := make(map[raft.NodeID]raft.Role, len(c.ids))
+	for _, id := range c.ids {
+		out[id] = c.nodes[id].Status().Role
+	}
+	return out
+}
+
+// Leader returns the unique Leader of the highest term among the nodes that
+// currently believe they are Leader, or nil when there is none. A Leader of
+// a lower term is a deposed Leader that has not heard about the new term
+// yet (legal in Raft); two Leaders in the same highest term are an Election
+// Safety violation, which the invariant checker reports and Leader() treats
+// as "no unique Leader".
+func (c *Cluster) Leader() *SimNode {
+	var best *SimNode
+	unique := false
+	for _, id := range c.ids {
+		n := c.nodes[id]
+		st := n.Status()
+		if st.Role != raft.Leader {
+			continue
+		}
+		switch {
+		case best == nil || st.Term > best.Status().Term:
+			best, unique = n, true
+		case st.Term == best.Status().Term:
+			unique = false
+		}
+	}
+	if !unique {
+		return nil
+	}
+	return best
+}
 
 // Run executes every event up to and including absolute time until, then
 // sets the clock to until. Run(Now()) fires events due right now; a past

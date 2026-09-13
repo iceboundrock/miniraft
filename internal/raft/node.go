@@ -102,6 +102,11 @@ type Node struct {
 	// Volatile state on leaders, reinitialized after election.
 	nextIndex  map[NodeID]Index
 	matchIndex map[NodeID]Index
+
+	// votes is the Candidate's tally for the current election, keyed by
+	// voter (a set, so duplicated responses cannot double count). nil
+	// outside an election.
+	votes map[NodeID]bool
 }
 
 // NewNode constructs a Node, loading currentTerm, votedFor and the log from
@@ -163,18 +168,35 @@ func (n *Node) Status() Status {
 }
 
 // Step processes an incoming message and returns the resulting actions.
-// Implemented in a later issue.
+//
+// The "higher term seen" rule (Figure 2, All Servers) runs first for every
+// message type: a message from a later term makes this node a Follower in
+// that term before the message itself is handled. AppendEntries handling is
+// implemented in a later issue.
 func (n *Node) Step(msg Message) ([]Action, error) {
 	if err := msg.Validate(); err != nil {
 		return nil, err
 	}
-	return nil, ErrNotImplemented
-}
-
-// ElectionTimeout tells the node its election timer fired.
-// Implemented in a later issue.
-func (n *Node) ElectionTimeout() ([]Action, error) {
-	return nil, ErrNotImplemented
+	var actions []Action
+	if msg.Term() > n.currentTerm {
+		stepDown, err := n.becomeFollower(msg.Term())
+		if err != nil {
+			return nil, err
+		}
+		actions = append(actions, stepDown...)
+	}
+	switch msg.Type {
+	case MsgRequestVote:
+		more, err := n.handleRequestVote(msg.From, msg.RequestVote)
+		if err != nil {
+			return nil, err
+		}
+		return append(actions, more...), nil
+	case MsgRequestVoteResponse:
+		return append(actions, n.handleRequestVoteResponse(msg.From, msg.RequestVoteResponse)...), nil
+	default:
+		return actions, ErrNotImplemented
+	}
 }
 
 // HeartbeatTimeout tells the node its heartbeat timer fired.

@@ -3,15 +3,17 @@ package simulator
 import (
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/iceboundrock/miniraft/internal/raft"
 	"github.com/iceboundrock/miniraft/internal/storage"
 )
 
 // Core is the part of *raft.Node the simulator drives: the four inputs of
-// ADR 0002 plus Status for inspection. It is an interface so that the
-// harness can be tested with scripted cores before the protocol exists.
+// ADR 0002, Start for the initial actions, and Status for inspection. It is
+// an interface so that the harness can be tested with scripted cores.
 type Core interface {
+	Start() []raft.Action
 	Step(msg raft.Message) ([]raft.Action, error)
 	ElectionTimeout() ([]raft.Action, error)
 	HeartbeatTimeout() ([]raft.Action, error)
@@ -54,6 +56,27 @@ func (n *SimNode) ElectionTimerArmed() bool { return n.electionTimer != 0 }
 // HeartbeatTimerArmed reports whether a heartbeat timer is pending.
 func (n *SimNode) HeartbeatTimerArmed() bool { return n.heartbeatTimer != 0 }
 
+// ElectionDeadline returns when the pending election timer fires; false when
+// none is armed. Tests use it to check that an event did (or did not) reset
+// the timer.
+func (n *SimNode) ElectionDeadline() (time.Duration, bool) {
+	return n.cluster.clock.Deadline(n.electionTimer)
+}
+
+// ForceElectionTimeout cancels the pending election timer, if any, and
+// delivers ElectionTimeout to the core right now. It is the fault-injection
+// hook for "this node's timer fires next": with it a test can make two nodes
+// start an election at the same instant (a split vote) by construction
+// instead of by searching for a seed. Like every other simulator entry
+// point it must be called by the test driver, not from inside the
+// simulation.
+func (n *SimNode) ForceElectionTimeout() {
+	n.cluster.clock.Stop(n.electionTimer)
+	n.electionTimer = 0
+	n.logger.Info("ForceElectionTimeout")
+	n.drive(n.core.ElectionTimeout)
+}
+
 // HandleMessage implements Handler: the message is stepped into the core.
 func (n *SimNode) HandleMessage(msg raft.Message) {
 	n.drive(func() ([]raft.Action, error) { return n.core.Step(msg) })
@@ -65,9 +88,10 @@ func (n *SimNode) Propose(cmd []byte) {
 	n.drive(func() ([]raft.Action, error) { return n.core.Propose(cmd) })
 }
 
-// drive calls one core input, records an error if it returns one, and then
-// executes the returned actions (whatever was returned, even alongside an
-// error, so that a partially failed step is visible on the timeline).
+// drive calls one core input, records an error if it returns one, executes
+// the returned actions (whatever was returned, even alongside an error, so
+// that a partially failed step is visible on the timeline), and then runs
+// the invariant checker over the whole cluster.
 func (n *SimNode) drive(input func() ([]raft.Action, error)) {
 	actions, err := input()
 	if err != nil {
@@ -75,6 +99,7 @@ func (n *SimNode) drive(input func() ([]raft.Action, error)) {
 		n.cluster.errs = append(n.cluster.errs, fmt.Errorf("node %s: %w", n.id, err))
 	}
 	n.Execute(actions)
+	n.cluster.checkInvariants()
 }
 
 // Execute translates actions into simulator operations, in order:

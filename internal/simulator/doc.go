@@ -6,7 +6,9 @@
 //
 // Everything runs on the goroutine that calls Cluster.Run, Step or RunUntil;
 // there are no goroutines, mutexes or wall-clock reads, so the same seed
-// always reproduces the same timeline. Crash/restart, seeded drop/duplicate
-// rates and the invariant checker are added by a later issue; only the hooks
-// exist here.
+// always reproduces the same timeline. After every core input the cluster
+// checks the Raft safety invariants it can observe from Status (Election
+// Safety, Term Monotonicity, Vote Safety) and records violations for
+// AssertInvariants. Crash/restart and seeded drop/duplicate rates are added
+// by a later issue; only the hooks exist here.
 package simulator
