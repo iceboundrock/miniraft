@@ -190,15 +190,20 @@ func (n *Network) Isolate(id raft.NodeID) {
 
 // Partition splits the network: nodes in different groups cannot exchange
 // messages in either direction. A node that appears in no group can talk to
-// nobody. A new Partition replaces the previous one; directed disconnects
-// stay in force independently.
+// nobody; a node listed in two groups is a mistake and panics. A new
+// Partition replaces the previous one; directed disconnects stay in force
+// independently.
 func (n *Network) Partition(groups ...[]raft.NodeID) {
-	n.partition = make(map[raft.NodeID]int)
+	partition := make(map[raft.NodeID]int)
 	for g, ids := range groups {
 		for _, id := range ids {
-			n.partition[id] = g
+			if _, dup := partition[id]; dup {
+				panic(fmt.Sprintf("simulator: Partition lists node %q in more than one group", id))
+			}
+			partition[id] = g
 		}
 	}
+	n.partition = partition
 	n.logger.Info("partition", "groups", fmt.Sprint(groups))
 }
 
@@ -218,8 +223,13 @@ func (n *Network) Drop(from, to raft.NodeID) {
 }
 
 // SetDuplicate turns message duplication on the link on or off. While on,
-// every Send schedules two deliveries, each with its own latency. Off by
-// default; a later issue adds a seeded duplication rate on top of this hook.
+// every Send schedules two deliveries, each with its own latency and its own
+// copy of the message. Off by default; a later issue adds a seeded
+// duplication rate on top of this hook.
+//
+// This is the "Duplicate(from,to) toggle" of issue #3. It takes an explicit
+// on/off argument instead of flipping state so that a test reads as a
+// statement of the link's condition, like Disconnect/Reconnect do.
 func (n *Network) SetDuplicate(from, to raft.NodeID, on bool) {
 	if on {
 		n.duplicate[link{from, to}] = true

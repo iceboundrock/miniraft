@@ -79,6 +79,11 @@ func (nopStateMachine) Apply(raft.LogEntry) ([]byte, error) { return nil, nil }
 
 // NewCluster builds the harness and one raft.Node per NodeID, each over a
 // fresh storage.MemoryStorage and a no-op state machine.
+//
+// No timer is armed here: the initial election timeout is chosen by the
+// core, and raft.Node has no start entry point until the election issue adds
+// one (issue #5, Start() returning the first ResetElectionTimer). Until then
+// a fresh cluster has no pending events and Run returns immediately.
 func NewCluster(cfg Config) (*Cluster, error) {
 	cfg = cfg.withDefaults()
 	c := &Cluster{
@@ -125,10 +130,14 @@ func NewCluster(cfg Config) (*Cluster, error) {
 
 // AddNode hosts core as node id: it becomes the network handler for id and
 // its actions are translated by the returned SimNode. NewCluster uses it for
-// raft.Nodes; tests use it for scripted cores. It panics on a duplicate id.
+// raft.Nodes; tests use it for scripted cores. It panics on a duplicate id
+// or a nil core.
 func (c *Cluster) AddNode(id raft.NodeID, core Core) *SimNode {
 	if _, dup := c.nodes[id]; dup {
 		panic(fmt.Sprintf("simulator: node %q already exists", id))
+	}
+	if core == nil {
+		panic(fmt.Sprintf("simulator: AddNode(%q) with nil Core", id))
 	}
 	n := &SimNode{id: id, core: core, cluster: c, logger: c.logger.With("node", id)}
 	c.nodes[id] = n

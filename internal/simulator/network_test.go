@@ -198,6 +198,18 @@ func TestNetworkPartitionAndHeal(t *testing.T) {
 	assertTerms(t, tn.nodes["b"], 4, 5)
 }
 
+// TestNetworkPartitionRejectsNodeInTwoGroups: a node cannot be on both sides
+// of a partition; the last group would silently win otherwise.
+func TestNetworkPartitionRejectsNodeInTwoGroups(t *testing.T) {
+	tn := newTestNetwork(t, 1, fixed(time.Millisecond), "a", "b", "c")
+	assertPanics(t, "Partition with b twice", func() {
+		tn.net.Partition([]raft.NodeID{"a", "b"}, []raft.NodeID{"b", "c"})
+	})
+	if !tn.net.Connected("a", "c") {
+		t.Fatal("a rejected Partition must leave the network unpartitioned")
+	}
+}
+
 // TestNetworkPartitionLosesInFlightMessages: a message sent before the
 // partition but not yet delivered is lost (policy is re-checked on delivery).
 func TestNetworkPartitionLosesInFlightMessages(t *testing.T) {

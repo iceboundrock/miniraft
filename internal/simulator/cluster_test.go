@@ -3,6 +3,7 @@ package simulator
 import (
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -191,9 +192,13 @@ func TestClusterRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
-func TestClusterAddNodeRejectsDuplicate(t *testing.T) {
+func TestClusterAddNodeRejectsDuplicateAndNil(t *testing.T) {
 	c := newTestCluster(t, Config{Seed: 1, NodeIDs: []raft.NodeID{"a"}})
 	assertPanics(t, "AddNode(a) twice", func() { c.AddNode("a", &fakeCore{id: "a"}) })
+	assertPanics(t, "AddNode(b, nil)", func() { c.AddNode("b", nil) })
+	if c.Node("b") != nil || len(c.Nodes()) != 1 {
+		t.Fatal("a rejected AddNode must not register the node")
+	}
 }
 
 // TestClusterRunUntil stops as soon as the predicate holds, or at maxTime.
@@ -275,10 +280,26 @@ func echoScenario(t *testing.T, seed int64) []string {
 	return c.Timeline()
 }
 
+// deliveryOrder returns the deliver events of a timeline with the timestamp
+// removed, so two runs compare by the order messages arrived, not by when.
+func deliveryOrder(timeline []string) []string {
+	var out []string
+	for _, line := range timeline {
+		if strings.Contains(line, " event=deliver ") {
+			_, rest, _ := strings.Cut(line, " ")
+			out = append(out, rest)
+		}
+	}
+	return out
+}
+
 // TestDeterministicReplay: the same seed yields a byte-identical timeline.
-// A different seed yields a different one — that is not a guarantee in
-// general (two seeds could draw the same latencies), but it holds for the
-// seeds used here and documents that the seed is what varies a run.
+// A different seed yields a different delivery order — that is not a
+// guarantee in general (two seeds could draw the same latencies), but it
+// holds for the seeds used here and documents that the seed is what varies
+// a run. The order check is separate from the timeline check because
+// latencies alone can make timelines differ while messages still arrive in
+// the same order.
 func TestDeterministicReplay(t *testing.T) {
 	first := echoScenario(t, 1)
 	second := echoScenario(t, 1)
@@ -291,5 +312,12 @@ func TestDeterministicReplay(t *testing.T) {
 	other := echoScenario(t, 2)
 	if slices.Equal(first, other) {
 		t.Fatal("seeds 1 and 2 produced identical timelines")
+	}
+	firstOrder, otherOrder := deliveryOrder(first), deliveryOrder(other)
+	if len(firstOrder) < 10 {
+		t.Fatalf("too few deliveries to compare order: %d", len(firstOrder))
+	}
+	if slices.Equal(firstOrder, otherOrder) {
+		t.Fatalf("seeds 1 and 2 delivered messages in the same order:\n%s", strings.Join(firstOrder, "\n"))
 	}
 }
