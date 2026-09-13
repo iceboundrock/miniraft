@@ -94,7 +94,9 @@ every test is reproducible from its seed. Its pieces:
   seeded-random latency. Faults: `Drop`, `Disconnect`/`Reconnect` (directional),
   `Isolate`, `Partition`/`Heal`, and an off-by-default `SetDuplicate` hook.
   Link policy is checked at send *and* at delivery, so messages already in
-  flight are lost when a partition or disconnect appears.
+  flight are lost when a partition or disconnect appears. Every scheduled
+  delivery carries its own deep copy of the message, as serialization would
+  on a real transport.
 - `Cluster` — hosts N `*raft.Node`s over `MemoryStorage`, translates the
   `Action`s they return into timers and sends, and drives everything with
   `Run(until)`, `Step()` or `RunUntil(pred, maxTime)`.

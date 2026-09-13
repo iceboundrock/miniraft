@@ -271,6 +271,63 @@ func TestNetworkDuplicateHook(t *testing.T) {
 	assertTerms(t, tn.nodes["b"], 1, 2, 2, 3)
 }
 
+// TestNetworkIsolatesInFlightMessages: a message in flight is a private
+// copy. Neither the sender mutating its message after Send nor the recipient
+// of the first duplicate mutating what it received changes a later delivery.
+func TestNetworkIsolatesInFlightMessages(t *testing.T) {
+	tn := newTestNetwork(t, 1, fixed(time.Millisecond), "a", "b")
+	tn.net.SetDuplicate("a", "b", true)
+	msg := raft.Message{
+		From: "a", To: "b", Type: raft.MsgAppendEntries,
+		AppendEntries: &raft.AppendEntries{
+			Term: 1, LeaderID: "a",
+			Entries: []raft.LogEntry{{Index: 1, Term: 1, Command: []byte("SET x 1")}},
+		},
+	}
+	tn.net.Send(msg)
+	// The sender reuses its payload after Send, as a real node might.
+	msg.AppendEntries.Term = 7
+	msg.AppendEntries.Entries[0].Command[0] = 'X'
+	msg.AppendEntries.Entries = nil
+
+	// The recipient scribbles on the first copy it receives.
+	first := true
+	b := tn.nodes["b"]
+	tn.net.Register("b", handlerFunc(func(got raft.Message) {
+		b.HandleMessage(got)
+		if first {
+			first = false
+			got.AppendEntries.Term = 8
+			got.AppendEntries.Entries[0].Command[0] = 'Y'
+		}
+	}))
+	tn.clock.Advance(time.Millisecond)
+
+	if len(b.got) != 2 {
+		t.Fatalf("delivered %d messages, want 2 (duplicate on)", len(b.got))
+	}
+	for i, d := range b.got {
+		ae := d.msg.AppendEntries
+		if ae == msg.AppendEntries {
+			t.Fatalf("delivery %d shares the sender's payload pointer", i)
+		}
+		if i == 0 && ae.Term == 8 {
+			continue // the first copy was mutated by the handler above, by design
+		}
+		if ae.Term != 1 || len(ae.Entries) != 1 || string(ae.Entries[0].Command) != "SET x 1" {
+			t.Fatalf("delivery %d = %+v, want the message as sent (term 1, SET x 1)", i, *ae)
+		}
+	}
+	if b.got[0].msg.AppendEntries == b.got[1].msg.AppendEntries {
+		t.Fatal("both duplicates share one payload")
+	}
+}
+
+// handlerFunc adapts a function to Handler.
+type handlerFunc func(raft.Message)
+
+func (f handlerFunc) HandleMessage(msg raft.Message) { f(msg) }
+
 // TestNetworkUnknownRecipientIsDropped: no handler registered => dropped and
 // logged, not a panic (a later issue uses this for crashed nodes).
 func TestNetworkUnknownRecipientIsDropped(t *testing.T) {

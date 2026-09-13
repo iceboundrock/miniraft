@@ -106,10 +106,15 @@ func (n *Network) Send(msg raft.Message) {
 	}
 }
 
+// schedule enqueues one delivery of msg. Each delivery gets its own deep
+// copy taken now, so the sender reusing its payload after Send, or the
+// recipient of one duplicate mutating it, cannot change what a later
+// delivery carries — the same isolation serialization gives a real transport.
 func (n *Network) schedule(msg raft.Message, log *slog.Logger) {
 	latency := n.latency()
 	log.Info("send", "latency", latency)
-	n.clock.After(latency, func() { n.deliver(msg, log) })
+	m := msg.Clone()
+	n.clock.After(latency, func() { n.deliver(m, log) })
 }
 
 func (n *Network) deliver(msg raft.Message, log *slog.Logger) {
