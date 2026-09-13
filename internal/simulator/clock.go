@@ -97,6 +97,16 @@ func (c *Clock) Step() bool {
 	return true
 }
 
+// Deadline returns when the timer id will fire. It reports false for a timer
+// that already fired, was stopped, or the zero TimerID.
+func (c *Clock) Deadline(id TimerID) (time.Duration, bool) {
+	ev, ok := c.timers[id]
+	if !ok {
+		return 0, false
+	}
+	return ev.At, true
+}
+
 // NextDeadline returns the deadline of the earliest pending event.
 func (c *Clock) NextDeadline() (time.Duration, bool) {
 	ev := c.queue.Peek()

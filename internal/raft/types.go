@@ -268,9 +268,18 @@ func (m Message) Term() Term {
 }
 
 // Validate reports whether the envelope is well formed: Type is known, the
-// matching payload (and only that payload) is set, and an AppendEntries
-// payload carries a well-formed suffix that follows PrevLogIndex (see
+// matching payload (and only that payload) is set, From names a sender, the
+// payload's self-identification (RequestVote.CandidateID,
+// AppendEntries.LeaderID) agrees with From, and an AppendEntries payload
+// carries a well-formed suffix that follows PrevLogIndex (see
 // ValidateEntries).
+//
+// The identity rule is a safety check, not tidiness: a voter persists
+// CandidateID but replies to From, so a mismatch would let one node count a
+// vote that was durably cast for another, and an empty CandidateID would be
+// persisted as "no vote" and leave the term open for a second grant.
+// Membership (From being a peer of the receiver) is the receiver's check,
+// since the envelope does not know the cluster.
 func (m Message) Validate() error {
 	set := 0
 	var want bool
@@ -297,8 +306,18 @@ func (m Message) Validate() error {
 		return fmt.Errorf("raft: message %s carries %d payloads, want 1", m.Type, set)
 	case !want:
 		return fmt.Errorf("raft: message type %s does not match its payload", m.Type)
+	case m.From == None:
+		return fmt.Errorf("raft: message %s has no sender", m.Type)
+	case m.To == None:
+		return fmt.Errorf("raft: message %s has no destination", m.Type)
+	}
+	if rv := m.RequestVote; rv != nil && rv.CandidateID != m.From {
+		return fmt.Errorf("raft: RequestVote from %q names candidate %q", m.From, rv.CandidateID)
 	}
 	if ae := m.AppendEntries; ae != nil {
+		if ae.LeaderID != m.From {
+			return fmt.Errorf("raft: AppendEntries from %q names leader %q", m.From, ae.LeaderID)
+		}
 		if err := ValidateEntries(ae.Entries, ae.PrevLogIndex+1); err != nil {
 			return fmt.Errorf("raft: AppendEntries payload: %w", err)
 		}

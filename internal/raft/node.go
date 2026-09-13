@@ -12,6 +12,12 @@ import (
 // implements. It exists so the skeleton compiles and is testable now.
 var ErrNotImplemented = errors.New("raft: not implemented")
 
+// ErrTermOverflow is returned when starting an election would advance
+// currentTerm past the maximum Term. Wrapping to 0 would violate Term
+// Monotonicity, so the node refuses instead; it can still vote and follow
+// in its current term.
+var ErrTermOverflow = errors.New("raft: currentTerm is at its maximum, cannot start an election")
+
 // Config configures a Node. All fields except Logger are required.
 type Config struct {
 	// ID is this node's identity.
@@ -102,6 +108,11 @@ type Node struct {
 	// Volatile state on leaders, reinitialized after election.
 	nextIndex  map[NodeID]Index
 	matchIndex map[NodeID]Index
+
+	// votes is the Candidate's tally for the current election, keyed by
+	// voter (a set, so duplicated responses cannot double count). nil
+	// outside an election.
+	votes map[NodeID]bool
 }
 
 // NewNode constructs a Node, loading currentTerm, votedFor and the log from
@@ -163,18 +174,59 @@ func (n *Node) Status() Status {
 }
 
 // Step processes an incoming message and returns the resulting actions.
-// Implemented in a later issue.
+//
+// A malformed envelope (Message.Validate), a message addressed to another
+// node, or a sender that is not a peer is rejected with an error before
+// anything else. Every Raft RPC is point-to-point, so a message whose To is
+// not this node was misrouted or replayed and must not touch consensus
+// state: a RequestVoteResponse granted to candidate c, stepped into
+// candidate a, would otherwise count as a's vote and let two Leaders win the
+// same term. Membership is fixed, so an unknown sender must not be able to
+// advance the term, obtain a vote or have a vote response counted.
+// Rejection changes no state and yields no actions; the error is diagnostic
+// for the host.
+//
+// The "higher term seen" rule (Figure 2, All Servers) then runs for every
+// message type: a message from a later term makes this node a Follower in
+// that term before the message itself is handled. AppendEntries handling is
+// implemented in a later issue.
+//
+// Step is two transitions in sequence, each atomic on its own. If the
+// step-down succeeded and only the handler's storage write failed, the node
+// is durably a Follower in the new term, so the step-down actions are still
+// returned alongside the error: a Leader's StopHeartbeatTimer and
+// ResetElectionTimer must reach the host, or it keeps a heartbeat timer for
+// a node that is no longer Leader and never arms an election timer.
 func (n *Node) Step(msg Message) ([]Action, error) {
 	if err := msg.Validate(); err != nil {
 		return nil, err
 	}
-	return nil, ErrNotImplemented
-}
-
-// ElectionTimeout tells the node its election timer fired.
-// Implemented in a later issue.
-func (n *Node) ElectionTimeout() ([]Action, error) {
-	return nil, ErrNotImplemented
+	if msg.To != n.id {
+		return nil, fmt.Errorf("raft: message %s from %q addressed to %q, not to %s", msg.Type, msg.From, msg.To, n.id)
+	}
+	if !n.isPeer(msg.From) {
+		return nil, fmt.Errorf("raft: message %s from %q, which is not a peer of %s", msg.Type, msg.From, n.id)
+	}
+	var actions []Action
+	if msg.Term() > n.currentTerm {
+		stepDown, err := n.becomeFollower(msg.Term())
+		if err != nil {
+			return nil, err
+		}
+		actions = append(actions, stepDown...)
+	}
+	switch msg.Type {
+	case MsgRequestVote:
+		more, err := n.handleRequestVote(msg.From, msg.RequestVote)
+		if err != nil {
+			return actions, err
+		}
+		return append(actions, more...), nil
+	case MsgRequestVoteResponse:
+		return append(actions, n.handleRequestVoteResponse(msg.From, msg.RequestVoteResponse)...), nil
+	default:
+		return actions, ErrNotImplemented
+	}
 }
 
 // HeartbeatTimeout tells the node its heartbeat timer fired.

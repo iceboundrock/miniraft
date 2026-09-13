@@ -15,6 +15,9 @@ func newTestCluster(t *testing.T, cfg Config) *Cluster {
 		t.Fatalf("NewCluster: %v", err)
 	}
 	t.Cleanup(func() {
+		if err := c.AssertInvariants(); err != nil {
+			t.Errorf("invariant violation: %v", err)
+		}
 		if t.Failed() {
 			t.Logf("timeline:\n%s", strings.Join(c.Timeline(), "\n"))
 		}
