@@ -308,6 +308,8 @@ func (m Message) Validate() error {
 		return fmt.Errorf("raft: message type %s does not match its payload", m.Type)
 	case m.From == None:
 		return fmt.Errorf("raft: message %s has no sender", m.Type)
+	case m.To == None:
+		return fmt.Errorf("raft: message %s has no destination", m.Type)
 	}
 	if rv := m.RequestVote; rv != nil && rv.CandidateID != m.From {
 		return fmt.Errorf("raft: RequestVote from %q names candidate %q", m.From, rv.CandidateID)

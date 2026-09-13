@@ -98,15 +98,18 @@ Rules worth knowing because they are easy to get subtly wrong:
   term loses.
 - **One vote per term**: `votedFor` is persisted before the response is
   produced, so a crash between the two cannot lead to a second vote.
-- **Sender identity is checked before the vote decision**: `Message.Validate`
-  rejects a `RequestVote` whose `CandidateID` is empty or differs from `From`
-  (the voter persists `CandidateID` but replies to `From`, so a mismatch
-  would let one node count a vote durably cast for another, and an empty
-  `CandidateID` would be persisted as "no vote" and leave the term open for
-  a second grant), and `Step` rejects any message whose sender is not a
-  peer before the higher-term rule runs, so an unknown node cannot advance
-  the term or be counted. A rejected message changes nothing and yields no
-  actions; the host gets an error.
+- **Envelope identity is checked before the vote decision**: `Message.Validate`
+  requires a sender and a destination and rejects a `RequestVote` whose
+  `CandidateID` is empty or differs from `From` (the voter persists
+  `CandidateID` but replies to `From`, so a mismatch would let one node
+  count a vote durably cast for another, and an empty `CandidateID` would
+  be persisted as "no vote" and leave the term open for a second grant).
+  `Step` then rejects any message not addressed to this node — every Raft
+  RPC is point-to-point, so a misrouted or replayed `RequestVoteResponse`
+  granted to another candidate must not be counted as this node's vote —
+  and any message whose sender is not a peer, both before the higher-term
+  rule runs, so neither can advance the term or be counted. A rejected
+  message changes nothing and yields no actions; the host gets an error.
 - **Vote tally is a set** keyed by voter, so a duplicated response cannot
   count twice.
 - **Election timer resets** happen only when a node starts an election,

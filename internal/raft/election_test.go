@@ -320,6 +320,47 @@ func TestStepRejectsUnknownSender(t *testing.T) {
 	requirePersisted(t, st, 1, "a")
 }
 
+// TestStepRejectsMisroutedMessage: every Raft RPC is point-to-point, so a
+// message whose To is another node must not touch consensus state, whatever
+// its sender or term. The dangerous case is a vote response: b's grant to
+// candidate c, replayed into candidate a, would otherwise be a's second vote
+// and both would become Leader in term 1.
+func TestStepRejectsMisroutedMessage(t *testing.T) {
+	t.Run("vote response for another candidate is not counted", func(t *testing.T) {
+		sa, sc := &memStorage{}, &memStorage{}
+		a := newTestNode(t, testConfig("a", "b", "c"), sa)
+		c := newTestNode(t, testConfig("c", "a", "b"), sc)
+		electionTimeout(t, a)
+		electionTimeout(t, c)
+		grant := voteResp("b", "c", 1, true)
+
+		if actions, err := a.Step(grant); err == nil || len(actions) != 0 {
+			t.Fatalf("a.Step(grant to c) = %v, %v; want no actions and an error", actions, err)
+		}
+		requireStatus(t, a, Candidate, 1, "a")
+		requirePersisted(t, sa, 1, "a")
+
+		actions := step(t, c, grant)
+		if countActions(actions, StopElectionTimer{}) != 1 {
+			t.Fatalf("c.Step(grant to c) = %v; want c to become Leader", actions)
+		}
+		requireStatus(t, c, Leader, 1, "c")
+	})
+
+	t.Run("higher-term request does not advance the term", func(t *testing.T) {
+		st := &memStorage{state: PersistentState{CurrentTerm: 1}}
+		n := newTestNode(t, testConfig("a", "b", "c"), st)
+		for _, to := range []NodeID{"c", "zz", None} {
+			req := voteReq("b", to, 9, 0, 0)
+			if actions, err := n.Step(req); err == nil || len(actions) != 0 {
+				t.Fatalf("Step(request to %q) = %v, %v; want no actions and an error", to, actions, err)
+			}
+			requireStatus(t, n, Follower, 1, None)
+			requirePersisted(t, st, 1, None)
+		}
+	})
+}
+
 func TestStaleLogCandidateDenied(t *testing.T) {
 	st := &memStorage{state: PersistentState{Entries: entries([2]uint64{1, 1}, [2]uint64{2, 2})}}
 	n := newTestNode(t, testConfig("a", "b", "c"), st)

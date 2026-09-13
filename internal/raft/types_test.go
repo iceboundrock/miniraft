@@ -50,24 +50,31 @@ func TestMessageJSONRoundTrip(t *testing.T) {
 }
 
 func TestMessageValidate(t *testing.T) {
+	// Every case is well-formed apart from the one thing its name says, so
+	// each rejection is for the stated reason.
 	bad := map[string]Message{
-		"no payload":    {From: "a", Type: MsgRequestVote},
-		"wrong payload": {From: "a", Type: MsgRequestVote, RequestVoteResponse: &RequestVoteResponse{}},
-		"two payloads":  {From: "a", Type: MsgAppendEntries, AppendEntries: &AppendEntries{}, RequestVote: &RequestVote{}},
-		"unknown type":  {From: "a", Type: 0, RequestVote: &RequestVote{}},
-		"no sender":     {Type: MsgRequestVoteResponse, RequestVoteResponse: &RequestVoteResponse{}},
+		"no payload":     {From: "a", To: "b", Type: MsgRequestVote},
+		"wrong payload":  {From: "a", To: "b", Type: MsgRequestVote, RequestVoteResponse: &RequestVoteResponse{}},
+		"two payloads":   {From: "a", To: "b", Type: MsgAppendEntries, AppendEntries: &AppendEntries{LeaderID: "a"}, RequestVote: &RequestVote{CandidateID: "a"}},
+		"unknown type":   {From: "a", To: "b", Type: 0, RequestVote: &RequestVote{CandidateID: "a"}},
+		"no sender":      {To: "b", Type: MsgRequestVoteResponse, RequestVoteResponse: &RequestVoteResponse{}},
+		"no destination": {From: "a", Type: MsgRequestVoteResponse, RequestVoteResponse: &RequestVoteResponse{}},
 		// The payload's self-identification must agree with the envelope:
 		// a voter records CandidateID but replies to From, so a mismatch
 		// would let the reply be counted by a node the vote was not cast for.
-		"empty CandidateID":      {From: "a", Type: MsgRequestVote, RequestVote: &RequestVote{Term: 1}},
-		"CandidateID not sender": {From: "a", Type: MsgRequestVote, RequestVote: &RequestVote{Term: 1, CandidateID: "b"}},
-		"empty LeaderID":         {From: "a", Type: MsgAppendEntries, AppendEntries: &AppendEntries{Term: 1}},
-		"LeaderID not sender":    {From: "a", Type: MsgAppendEntries, AppendEntries: &AppendEntries{Term: 1, LeaderID: "b"}},
+		"empty CandidateID":      {From: "a", To: "b", Type: MsgRequestVote, RequestVote: &RequestVote{Term: 1}},
+		"CandidateID not sender": {From: "a", To: "b", Type: MsgRequestVote, RequestVote: &RequestVote{Term: 1, CandidateID: "b"}},
+		"empty LeaderID":         {From: "a", To: "b", Type: MsgAppendEntries, AppendEntries: &AppendEntries{Term: 1}},
+		"LeaderID not sender":    {From: "a", To: "b", Type: MsgAppendEntries, AppendEntries: &AppendEntries{Term: 1, LeaderID: "b"}},
 	}
 	for name, m := range bad {
 		if err := m.Validate(); err == nil {
 			t.Errorf("%s: Validate() = nil, want error", name)
 		}
+	}
+	good := Message{From: "a", To: "b", Type: MsgRequestVoteResponse, RequestVoteResponse: &RequestVoteResponse{Term: 1}}
+	if err := good.Validate(); err != nil {
+		t.Errorf("well-formed message rejected: %v", err)
 	}
 }
 
@@ -120,7 +127,7 @@ func TestValidateEntries(t *testing.T) {
 
 func TestMessageValidateAppendEntriesPayload(t *testing.T) {
 	ae := func(prev Index, es []LogEntry) Message {
-		return Message{From: "a", Type: MsgAppendEntries, AppendEntries: &AppendEntries{Term: 1, LeaderID: "a", PrevLogIndex: prev, Entries: es}}
+		return Message{From: "a", To: "b", Type: MsgAppendEntries, AppendEntries: &AppendEntries{Term: 1, LeaderID: "a", PrevLogIndex: prev, Entries: es}}
 	}
 	if err := ae(7, entries([2]uint64{8, 1}, [2]uint64{9, 1})).Validate(); err != nil {
 		t.Fatalf("well-formed AppendEntries rejected: %v", err)
