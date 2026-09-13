@@ -98,6 +98,15 @@ Rules worth knowing because they are easy to get subtly wrong:
   term loses.
 - **One vote per term**: `votedFor` is persisted before the response is
   produced, so a crash between the two cannot lead to a second vote.
+- **Sender identity is checked before the vote decision**: `Message.Validate`
+  rejects a `RequestVote` whose `CandidateID` is empty or differs from `From`
+  (the voter persists `CandidateID` but replies to `From`, so a mismatch
+  would let one node count a vote durably cast for another, and an empty
+  `CandidateID` would be persisted as "no vote" and leave the term open for
+  a second grant), and `Step` rejects any message whose sender is not a
+  peer before the higher-term rule runs, so an unknown node cannot advance
+  the term or be counted. A rejected message changes nothing and yields no
+  actions; the host gets an error.
 - **Vote tally is a set** keyed by voter, so a duplicated response cannot
   count twice.
 - **Election timer resets** happen only when a node starts an election,
@@ -179,7 +188,10 @@ every test is reproducible from its seed. Its pieces:
 - **Invariant checker** — after every core input the cluster observes every
   node's `Status()` and records violations of Election Safety (at most one
   Leader per term over the whole run), Term Monotonicity (a node's term never
-  decreases) and Vote Safety (a node never changes its vote within a term).
+  decreases) and Vote Safety (a node never votes for two different nodes
+  within one term — every non-empty vote is compared against the first one
+  observed for that node and term, so a vote that is cleared and re-granted
+  to someone else is still caught).
   `AssertInvariants()` returns them; the test helper calls it at the end of
   every simulator test.
 

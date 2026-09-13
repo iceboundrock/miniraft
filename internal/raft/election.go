@@ -171,7 +171,8 @@ func (n *Node) becomeFollower(term Term) ([]Action, error) {
 }
 
 // handleRequestVote implements the receiver side of RequestVote (Figure 2).
-// The caller has already applied the higher-term rule, so msg.Term <=
+// The caller has already validated the message (so rv.CandidateID == from
+// and from is a peer) and applied the higher-term rule, so msg.Term <=
 // currentTerm here. A vote is granted iff the request is for the current
 // term, the node has not voted for someone else in it, and the candidate's
 // log is at least as up-to-date. The grant is persisted before the response
@@ -210,9 +211,10 @@ func (n *Node) handleRequestVote(from NodeID, rv *RequestVote) ([]Action, error)
 // handleRequestVoteResponse tallies a vote. Only a Candidate in exactly the
 // response's term counts it (a stale response belongs to an election that
 // is over), and the tally is a set keyed by voter so a duplicated response
-// cannot count twice.
+// cannot count twice. Step has already rejected senders that are not peers,
+// so every counted voter is a cluster member.
 func (n *Node) handleRequestVoteResponse(from NodeID, resp *RequestVoteResponse) []Action {
-	if n.role != Candidate || resp.Term != n.currentTerm || !resp.VoteGranted || !n.isPeer(from) {
+	if n.role != Candidate || resp.Term != n.currentTerm || !resp.VoteGranted {
 		return nil
 	}
 	n.votes[from] = true

@@ -246,6 +246,80 @@ func TestOneVotePerTerm(t *testing.T) {
 	requireStatus(t, n, Follower, 1, "b")
 }
 
+// TestRequestVoteIdentityRejected: a RequestVote whose CandidateID is empty
+// or differs from the sender is rejected before the vote decision, with
+// nothing persisted and no reply. Without this a voter would persist one
+// identity and reply to another: CandidateID == None would be persisted as
+// "no vote", so a real candidate of the same term would be granted too (two
+// grants in one term), and a request from b naming c would be counted by b
+// while the durable vote says c.
+func TestRequestVoteIdentityRejected(t *testing.T) {
+	t.Run("empty CandidateID does not open a second grant", func(t *testing.T) {
+		st := &memStorage{}
+		n := newTestNode(t, testConfig("a", "b", "c"), st)
+		bad := voteReq("b", "a", 1, 0, 0)
+		bad.RequestVote.CandidateID = None
+		if actions, err := n.Step(bad); err == nil || len(actions) != 0 {
+			t.Fatalf("Step(empty CandidateID) = %v, %v; want no actions and an error", actions, err)
+		}
+		requireStatus(t, n, Follower, 0, None)
+		requirePersisted(t, st, 0, None)
+
+		// The real candidates of term 1 still get exactly one grant between them.
+		if msgs := sends(step(t, n, voteReq("b", "a", 1, 0, 0))); len(msgs) != 1 || !msgs[0].RequestVoteResponse.VoteGranted {
+			t.Fatalf("b got %v, want a grant", msgs)
+		}
+		if msgs := sends(step(t, n, voteReq("c", "a", 1, 0, 0))); len(msgs) != 1 || msgs[0].RequestVoteResponse.VoteGranted {
+			t.Fatalf("c got %v, want a denial", msgs)
+		}
+		requireStatus(t, n, Follower, 1, "b")
+		requirePersisted(t, st, 1, "b")
+	})
+	t.Run("CandidateID differs from sender", func(t *testing.T) {
+		st := &memStorage{}
+		n := newTestNode(t, testConfig("a", "b", "c"), st)
+		bad := voteReq("b", "a", 1, 0, 0)
+		bad.RequestVote.CandidateID = "c"
+		if actions, err := n.Step(bad); err == nil || len(actions) != 0 {
+			t.Fatalf("Step(CandidateID != From) = %v, %v; want no actions and an error", actions, err)
+		}
+		requireStatus(t, n, Follower, 0, None)
+		requirePersisted(t, st, 0, None)
+
+		// Neither b nor c has been voted for; c's own request is the first
+		// and only grant of the term.
+		if msgs := sends(step(t, n, voteReq("c", "a", 1, 0, 0))); len(msgs) != 1 || !msgs[0].RequestVoteResponse.VoteGranted {
+			t.Fatalf("c got %v, want a grant", msgs)
+		}
+		if msgs := sends(step(t, n, voteReq("b", "a", 1, 0, 0))); len(msgs) != 1 || msgs[0].RequestVoteResponse.VoteGranted {
+			t.Fatalf("b got %v, want a denial", msgs)
+		}
+		requireStatus(t, n, Follower, 1, "c")
+		requirePersisted(t, st, 1, "c")
+	})
+}
+
+// TestStepRejectsUnknownSender: membership is fixed, so a message from a
+// node that is not a peer is rejected before the higher-term rule runs. An
+// unknown node must not be able to bump the term, obtain a vote, or have its
+// vote response counted.
+func TestStepRejectsUnknownSender(t *testing.T) {
+	st := &memStorage{}
+	n := newTestNode(t, testConfig("a", "b", "c"), st)
+	electionTimeout(t, n)
+
+	if actions, err := n.Step(voteResp("zz", "a", 1, true)); err == nil || len(actions) != 0 {
+		t.Fatalf("Step(response from zz) = %v, %v; want no actions and an error", actions, err)
+	}
+	requireStatus(t, n, Candidate, 1, "a") // the vote did not count
+
+	if actions, err := n.Step(voteReq("zz", "a", 9, 0, 0)); err == nil || len(actions) != 0 {
+		t.Fatalf("Step(request from zz) = %v, %v; want no actions and an error", actions, err)
+	}
+	requireStatus(t, n, Candidate, 1, "a") // no step-down to term 9
+	requirePersisted(t, st, 1, "a")
+}
+
 func TestStaleLogCandidateDenied(t *testing.T) {
 	st := &memStorage{state: PersistentState{Entries: entries([2]uint64{1, 1}, [2]uint64{2, 2})}}
 	n := newTestNode(t, testConfig("a", "b", "c"), st)
@@ -352,7 +426,6 @@ func TestVoteResponsesThatDoNotCount(t *testing.T) {
 
 	step(t, n, voteResp("b", "a", 1, false)) // denied
 	step(t, n, voteResp("b", "a", 0, true))  // stale term
-	step(t, n, voteResp("zz", "a", 1, true)) // not a peer
 	requireStatus(t, n, Candidate, 1, "a")
 
 	// A Follower ignores responses entirely.

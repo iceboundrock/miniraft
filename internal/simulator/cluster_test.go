@@ -346,6 +346,36 @@ func TestInvariantChecker(t *testing.T) {
 			t.Fatalf("AssertInvariants() = %v, want a Vote Safety violation", err)
 		}
 	})
+	t.Run("vote safety across a cleared vote", func(t *testing.T) {
+		// The vote is compared against the first vote observed in the term,
+		// not the previous observation: a faulty core that clears votedFor
+		// without changing the term and then votes for someone else must
+		// still be caught.
+		c, fa, _ := newScripted(t)
+		fa.status = raft.Status{Term: 1, VotedFor: "b"}
+		poke(c)
+		fa.status = raft.Status{Term: 1, VotedFor: raft.None}
+		poke(c)
+		fa.status = raft.Status{Term: 1, VotedFor: "a"}
+		poke(c)
+		if err := c.AssertInvariants(); err == nil || !strings.Contains(err.Error(), "Vote Safety") {
+			t.Fatalf("AssertInvariants() = %v, want a Vote Safety violation", err)
+		}
+	})
+	t.Run("vote safety allows a new vote in a new term", func(t *testing.T) {
+		c, fa, _ := newScripted(t)
+		fa.status = raft.Status{Term: 1, VotedFor: "b"}
+		poke(c)
+		fa.status = raft.Status{Term: 2, VotedFor: raft.None}
+		poke(c)
+		fa.status = raft.Status{Term: 2, VotedFor: "a"}
+		poke(c)
+		fa.status = raft.Status{Term: 2, VotedFor: "a"} // the same vote again is fine
+		poke(c)
+		if err := c.AssertInvariants(); err != nil {
+			t.Fatalf("AssertInvariants() = %v, want nil", err)
+		}
+	})
 	t.Run("assert checks current state", func(t *testing.T) {
 		c, fa, fb := newScripted(t)
 		fa.status = raft.Status{Role: raft.Leader, Term: 1}

@@ -175,7 +175,13 @@ func (n *Node) Status() Status {
 
 // Step processes an incoming message and returns the resulting actions.
 //
-// The "higher term seen" rule (Figure 2, All Servers) runs first for every
+// A malformed envelope (Message.Validate) or a sender that is not a peer is
+// rejected with an error before anything else: membership is fixed, so an
+// unknown node must not be able to advance the term, obtain a vote or have
+// a vote response counted. Rejection changes no state and yields no
+// actions; the error is diagnostic for the host.
+//
+// The "higher term seen" rule (Figure 2, All Servers) then runs for every
 // message type: a message from a later term makes this node a Follower in
 // that term before the message itself is handled. AppendEntries handling is
 // implemented in a later issue.
@@ -189,6 +195,9 @@ func (n *Node) Status() Status {
 func (n *Node) Step(msg Message) ([]Action, error) {
 	if err := msg.Validate(); err != nil {
 		return nil, err
+	}
+	if !n.isPeer(msg.From) {
+		return nil, fmt.Errorf("raft: message %s from %q, which is not a peer of %s", msg.Type, msg.From, n.id)
 	}
 	var actions []Action
 	if msg.Term() > n.currentTerm {
