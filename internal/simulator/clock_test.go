@@ -175,6 +175,36 @@ func TestClockRejectsOverflow(t *testing.T) {
 	}
 }
 
+// TestClockRejectsReentrantDriving: a callback may arm and stop timers, but
+// it must not drive the clock. Before the guard, an inner Advance moved Now()
+// to 3ms and the outer Advance then reset it to its own 1ms target, so time
+// went backwards. The clock now panics at the inner call; the panic unwinds
+// through the outer call, leaving Now() at the callback's deadline and the
+// clock usable afterwards.
+func TestClockRejectsReentrantDriving(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		inner func(c *Clock)
+	}{
+		{"Advance", func(c *Clock) { c.Advance(2 * time.Millisecond) }},
+		{"Step", func(c *Clock) { c.Step() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewClock()
+			c.After(time.Millisecond, func() { tc.inner(c) })
+			c.After(2*time.Millisecond, func() {}) // gives the inner Step something to fire
+			assertPanics(t, "nested "+tc.name, func() { c.Advance(time.Millisecond) })
+			if c.Now() != time.Millisecond {
+				t.Fatalf("Now() = %v after rejected nested %s, want 1ms", c.Now(), tc.name)
+			}
+			c.Advance(time.Millisecond)
+			if c.Now() != 2*time.Millisecond || c.Pending() != 0 {
+				t.Fatalf("Now() = %v, Pending() = %d after recovery; want 2ms, 0", c.Now(), c.Pending())
+			}
+		})
+	}
+}
+
 func assertPanics(t *testing.T, name string, fn func()) {
 	t.Helper()
 	defer func() {

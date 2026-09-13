@@ -187,7 +187,9 @@ func (c *Cluster) Now() time.Duration { return c.clock.Now() }
 
 // Run executes every event up to and including absolute time until, then
 // sets the clock to until. Run(Now()) fires events due right now; a past
-// until is a no-op.
+// until is a no-op. Run, Step and RunUntil belong to the test driver: calling
+// them from inside the simulation (a Core method or a timer callback) panics,
+// see Clock.
 func (c *Cluster) Run(until time.Duration) {
 	// Compare absolute times before subtracting: until-Now() wraps positive
 	// for a sufficiently old until, which would reach Advance and panic.

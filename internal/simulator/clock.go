@@ -18,10 +18,16 @@ type TimerID uint64
 // Invariant: Now() <= At of every pending event. Logical time ends at
 // math.MaxInt64; After and Advance panic rather than wrap past it, because a
 // wrapped deadline would sort before Now() and move the clock backwards.
+//
+// Only the test driver moves time. A timer callback may call Now, After,
+// Stop, NextDeadline and Pending, but not Advance or Step: the clock panics
+// on a nested drive, because the outer call would otherwise finish by setting
+// Now() to its own, older target.
 type Clock struct {
-	now    time.Duration
-	queue  EventQueue
-	timers map[TimerID]*Event
+	now     time.Duration
+	queue   EventQueue
+	timers  map[TimerID]*Event
+	driving bool // set while Advance or Step runs; rejects a nested drive
 }
 
 // NewClock returns a clock at time 0 with no timers.
@@ -61,11 +67,13 @@ func (c *Clock) Stop(id TimerID) bool {
 // <= Now()+d in order. While a callback runs, Now() equals its deadline;
 // timers armed by a callback with a deadline inside the window fire in the
 // same call. Afterwards Now() == the target time even if no timer fired. It
-// panics on a negative d or on a target beyond the end of logical time.
+// panics on a negative d, on a target beyond the end of logical time, or when
+// called from a timer callback.
 func (c *Clock) Advance(d time.Duration) {
 	if d < 0 {
 		panic("simulator: Clock.Advance with negative duration")
 	}
+	defer c.drive("Advance")()
 	target := c.deadline(d, "Advance")
 	for {
 		ev := c.queue.Peek()
@@ -78,8 +86,10 @@ func (c *Clock) Advance(d time.Duration) {
 }
 
 // Step fires the next pending event, moving Now() to its deadline. It
-// reports false, and leaves the clock unchanged, when nothing is pending.
+// reports false, and leaves the clock unchanged, when nothing is pending. It
+// panics when called from a timer callback.
 func (c *Clock) Step() bool {
+	defer c.drive("Step")()
 	if c.queue.Peek() == nil {
 		return false
 	}
@@ -112,6 +122,18 @@ func (c *Clock) deadline(d time.Duration, op string) time.Duration {
 		panic("simulator: Clock." + op + " deadline overflows logical time")
 	}
 	return c.now + d
+}
+
+// drive marks the clock as being driven by op for the duration of the call
+// and returns the function that clears the mark. A nested drive panics: the
+// callback that issued it runs inside an outer Advance or Step whose final
+// "now = target" would move time backwards past whatever the nested call did.
+func (c *Clock) drive(op string) func() {
+	if c.driving {
+		panic("simulator: Clock." + op + " called from a timer callback")
+	}
+	c.driving = true
+	return func() { c.driving = false }
 }
 
 // fire pops and runs the earliest event. The queue is ordered and Now() never
