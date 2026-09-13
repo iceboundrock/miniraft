@@ -27,7 +27,11 @@ Atomic replace is: write `<name>.tmp`, `fsync` it, `rename` over `<name>`,
 version intact while the new one is incomplete; the file `fsync` orders the
 data before the rename (rename is not ordered against data writes); POSIX
 `rename` is atomic so a reader sees the whole old file or the whole new one;
-the directory `fsync` makes the rename itself durable.
+the directory `fsync` makes the rename itself durable. That last `fsync` is
+the commit point: once it returns, the in-memory copy is updated and closing
+file handles is best-effort cleanup that is never reported as a failure of
+the operation, so `nil` from `SaveTermVote`/`TruncateSuffix` always means
+"durable" and an error always means "the in-memory copy is unchanged".
 
 `Open` loads both files into memory, so `Load()` is a copy and never reads
 disk. Recovery rules, in order of what a crash can leave behind:

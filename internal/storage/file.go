@@ -189,10 +189,11 @@ func (f *FileStorage) SaveTermVote(term raft.Term, votedFor raft.NodeID) error {
 	if err != nil {
 		return err
 	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("storage: close %s: %w", stateFileName, err)
-	}
+	// The new state is durable once replaceFile returns, so the in-memory copy
+	// follows the disk unconditionally; closing the handle is cleanup and
+	// cannot undo the replace (see replaceFile), so its result is not reported.
 	f.term, f.votedFor = term, votedFor
+	_ = tmp.Close()
 	return nil
 }
 
@@ -262,15 +263,15 @@ func (f *FileStorage) TruncateSuffix(from raft.Index) error {
 	if err != nil {
 		return err
 	}
-	// The old handle still points at the unlinked previous file; the new
-	// handle was opened with O_APPEND on the file that is now log.jsonl.
+	// The new handle was opened with O_APPEND on the file that is now
+	// log.jsonl. The old handle points at the unlinked previous file: nothing
+	// will read or write it again, and the truncation is already durable, so a
+	// failure to close it is not reported as a failed truncation.
 	old := f.logFile
 	f.logFile = newFile
 	f.logSize = int64(len(data))
 	f.entries = raft.CloneEntries(keep)
-	if err := old.Close(); err != nil {
-		return fmt.Errorf("storage: close previous %s: %w", logFileName, err)
-	}
+	_ = old.Close()
 	return nil
 }
 
@@ -314,6 +315,14 @@ func encodeLog(entries []raft.LogEntry) ([]byte, error) {
 //     complete old file or the complete new one, never a mix;
 //  4. syncDir(dir)         — the rename itself is a directory modification and
 //     only becomes durable once the directory is synced.
+//
+// Step 4 is the commit point: when replaceFile returns nil the replace has
+// happened and is durable, and nothing the caller does afterwards (closing the
+// returned handle, releasing an older one) can undo it. Callers therefore
+// update their in-memory state as soon as replaceFile returns and treat handle
+// cleanup as best-effort, so that nil always means "durable" and on error the
+// in-memory copy still describes the last acknowledged state (the disk may
+// then hold either version; neither was acknowledged to the core as new).
 func replaceFile(dir, name string, data []byte) (*os.File, error) {
 	path := filepath.Join(dir, name)
 	tmpPath := path + tmpSuffix

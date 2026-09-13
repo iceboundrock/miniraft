@@ -23,6 +23,19 @@ func mustOpen(t *testing.T, dir string) *FileStorage {
 	return fs
 }
 
+// reopenAfterCrash simulates a process crash: the directory is reopened while
+// crashed is abandoned without Close, exactly as after a kill, so nothing runs
+// between the last acknowledged write and the reopen. The abandoned handle is
+// released at test end only so the test does not leak a descriptor;
+// FileStorage.Close writes nothing, so that cannot affect what the reopen saw.
+func reopenAfterCrash(t *testing.T, crashed *FileStorage) *FileStorage {
+	t.Helper()
+	t.Cleanup(func() { crashed.Close() })
+	fs := mustOpen(t, crashed.dir)
+	t.Cleanup(func() { fs.Close() })
+	return fs
+}
+
 func mustLoad(t *testing.T, st raft.Storage) raft.PersistentState {
 	t.Helper()
 	s, err := st.Load()
@@ -51,9 +64,7 @@ func TestFileStorageReopenPreservesState(t *testing.T) {
 	if err := fs.AppendEntries(batch); err != nil {
 		t.Fatal(err)
 	}
-	// Simulate a crash: reopen without Close.
-	fs2 := mustOpen(t, dir)
-	defer fs2.Close()
+	fs2 := reopenAfterCrash(t, fs)
 	want := raft.PersistentState{CurrentTerm: 5, VotedFor: "b", Entries: batch}
 	if s := mustLoad(t, fs2); !reflect.DeepEqual(s, want) {
 		t.Fatalf("after reopen Load() = %+v, want %+v", s, want)
@@ -72,8 +83,7 @@ func TestFileStorageTruncateThenAppend(t *testing.T) {
 	if err := fs.AppendEntries(storagetest.Entries([2]uint64{2, 3}, [2]uint64{3, 3})); err != nil {
 		t.Fatal(err)
 	}
-	fs2 := mustOpen(t, dir)
-	defer fs2.Close()
+	fs2 := reopenAfterCrash(t, fs)
 	want := storagetest.Entries([2]uint64{1, 1}, [2]uint64{2, 3}, [2]uint64{3, 3})
 	if s := mustLoad(t, fs2); !reflect.DeepEqual(s.Entries, want) {
 		t.Fatalf("after reopen Entries = %+v, want %+v", s.Entries, want)
@@ -106,7 +116,7 @@ func TestFileStorageDiscardsPartialTrailingLine(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fs2 := mustOpen(t, dir)
+	fs2 := reopenAfterCrash(t, fs)
 	want := storagetest.Entries([2]uint64{1, 1})
 	if s := mustLoad(t, fs2); !reflect.DeepEqual(s.Entries, want) {
 		t.Fatalf("Load() after partial tail = %+v, want %+v", s.Entries, want)
@@ -115,8 +125,7 @@ func TestFileStorageDiscardsPartialTrailingLine(t *testing.T) {
 	if err := fs2.AppendEntries(storagetest.Entries([2]uint64{2, 7})); err != nil {
 		t.Fatal(err)
 	}
-	fs3 := mustOpen(t, dir)
-	defer fs3.Close()
+	fs3 := reopenAfterCrash(t, fs2)
 	want = storagetest.Entries([2]uint64{1, 1}, [2]uint64{2, 7})
 	if s := mustLoad(t, fs3); !reflect.DeepEqual(s.Entries, want) {
 		t.Fatalf("Load() after append over repaired tail = %+v, want %+v", s.Entries, want)
@@ -140,8 +149,7 @@ func TestFileStorageDiscardsUnterminatedValidLine(t *testing.T) {
 	if err := os.Truncate(path, int64(len(data)-1)); err != nil {
 		t.Fatal(err)
 	}
-	fs2 := mustOpen(t, dir)
-	defer fs2.Close()
+	fs2 := reopenAfterCrash(t, fs)
 	if s := mustLoad(t, fs2); len(s.Entries) != 1 {
 		t.Fatalf("Load() = %+v, want only entry 1", s.Entries)
 	}
@@ -244,5 +252,33 @@ func TestFileStorageStateFileIsHumanReadable(t *testing.T) {
 	}
 	if !bytes.Contains(data, []byte(`"currentTerm"`)) || !bytes.Contains(data, []byte(`"votedFor"`)) {
 		t.Fatalf("state.json = %s, want currentTerm/votedFor keys", data)
+	}
+}
+
+func TestFileStorageTruncateSucceedsWhenOldHandleCloseFails(t *testing.T) {
+	// Once the rewritten log has been renamed into place and the directory
+	// synced, the truncation is durable; releasing the previous append handle
+	// is cleanup and cannot fail it. Force that Close to fail by closing the
+	// handle underneath the storage (white-box) and check the result still
+	// reflects the disk.
+	dir := t.TempDir()
+	fs := mustOpen(t, dir)
+	defer fs.Close()
+	if err := fs.AppendEntries(storagetest.Entries([2]uint64{1, 1}, [2]uint64{2, 1})); err != nil {
+		t.Fatal(err)
+	}
+	fs.logFile.Close()
+	if err := fs.TruncateSuffix(2); err != nil {
+		t.Fatalf("TruncateSuffix reported failure although the rewrite is durable: %v", err)
+	}
+	// The storage keeps working on the new handle.
+	if err := fs.AppendEntries(storagetest.Entries([2]uint64{2, 4})); err != nil {
+		t.Fatal(err)
+	}
+	fs2 := mustOpen(t, dir)
+	defer fs2.Close()
+	want := storagetest.Entries([2]uint64{1, 1}, [2]uint64{2, 4})
+	if s := mustLoad(t, fs2); !reflect.DeepEqual(s.Entries, want) {
+		t.Fatalf("after reopen Entries = %+v, want %+v", s.Entries, want)
 	}
 }
