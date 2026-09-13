@@ -28,8 +28,10 @@ func testConfig(id NodeID, peers ...NodeID) Config {
 // appends and no shared Command bytes.
 type memStorage struct {
 	state PersistentState
-	// failSave, when set, makes SaveTermVote fail without writing.
-	failSave error
+	// failSave, when set, makes SaveTermVote fail without writing once
+	// failSaveAfter more calls have succeeded (0 = fail the next call).
+	failSave      error
+	failSaveAfter int
 }
 
 func (m *memStorage) Load() (PersistentState, error) {
@@ -40,7 +42,10 @@ func (m *memStorage) Load() (PersistentState, error) {
 
 func (m *memStorage) SaveTermVote(term Term, votedFor NodeID) error {
 	if m.failSave != nil {
-		return m.failSave
+		if m.failSaveAfter == 0 {
+			return m.failSave
+		}
+		m.failSaveAfter--
 	}
 	m.state.CurrentTerm, m.state.VotedFor = term, votedFor
 	return nil

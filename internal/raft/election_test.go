@@ -2,6 +2,7 @@ package raft
 
 import (
 	"errors"
+	"math"
 	"reflect"
 	"testing"
 	"time"
@@ -430,6 +431,49 @@ func TestSaveTermVoteFailureLeavesStateUnchanged(t *testing.T) {
 	}
 	requireStatus(t, n, Follower, 0, None)
 	requirePersisted(t, st, 0, None)
+}
+
+// TestStepDownActionsSurviveVoteWriteFailure: a Leader that receives a
+// higher-term RequestVote first steps down (persisting the term and emitting
+// StopHeartbeatTimer + ResetElectionTimer) and then persists the vote grant.
+// If only the second write fails, the node is durably a Follower in the new
+// term, so Step must still return the step-down actions alongside the error;
+// dropping them would leave the host with a stale heartbeat timer and no
+// election timer. No vote response is sent because no vote was recorded.
+func TestStepDownActionsSurviveVoteWriteFailure(t *testing.T) {
+	boom := errors.New("disk full")
+	n, st := makeLeader(t)
+	st.failSave, st.failSaveAfter = boom, 1 // term write succeeds, vote write fails
+
+	actions, err := n.Step(voteReq("c", "a", 2, 0, 0))
+	if !errors.Is(err, boom) {
+		t.Fatalf("Step error = %v, want disk full", err)
+	}
+	want := []Action{StopHeartbeatTimer{}, ResetElectionTimer{}}
+	if len(actions) != len(want) ||
+		countActions(actions, StopHeartbeatTimer{}) != 1 || countActions(actions, ResetElectionTimer{}) != 1 {
+		t.Fatalf("actions = %v, want exactly %v", actions, want)
+	}
+	if msgs := sends(actions); len(msgs) != 0 {
+		t.Fatalf("sent %v, want no vote response", msgs)
+	}
+	requireStatus(t, n, Follower, 2, None)
+	requirePersisted(t, st, 2, None)
+}
+
+// TestElectionTimeoutAtMaxTermFails: currentTerm+1 would wrap to 0 at the
+// maximum term, which breaks Term Monotonicity. The node must refuse to start
+// the election, leaving state and storage untouched and producing no actions.
+func TestElectionTimeoutAtMaxTermFails(t *testing.T) {
+	st := &memStorage{state: PersistentState{CurrentTerm: math.MaxUint64}}
+	n := newTestNode(t, testConfig("a", "b", "c"), st)
+
+	actions, err := n.ElectionTimeout()
+	if !errors.Is(err, ErrTermOverflow) || len(actions) != 0 {
+		t.Fatalf("ElectionTimeout = (%v, %v), want (nil, ErrTermOverflow)", actions, err)
+	}
+	requireStatus(t, n, Follower, math.MaxUint64, None)
+	requirePersisted(t, st, math.MaxUint64, None)
 }
 
 func TestBecomeFollowerRejectsLowerTerm(t *testing.T) {

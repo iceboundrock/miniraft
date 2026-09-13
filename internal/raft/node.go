@@ -12,6 +12,12 @@ import (
 // implements. It exists so the skeleton compiles and is testable now.
 var ErrNotImplemented = errors.New("raft: not implemented")
 
+// ErrTermOverflow is returned when starting an election would advance
+// currentTerm past the maximum Term. Wrapping to 0 would violate Term
+// Monotonicity, so the node refuses instead; it can still vote and follow
+// in its current term.
+var ErrTermOverflow = errors.New("raft: currentTerm is at its maximum, cannot start an election")
+
 // Config configures a Node. All fields except Logger are required.
 type Config struct {
 	// ID is this node's identity.
@@ -173,6 +179,13 @@ func (n *Node) Status() Status {
 // message type: a message from a later term makes this node a Follower in
 // that term before the message itself is handled. AppendEntries handling is
 // implemented in a later issue.
+//
+// Step is two transitions in sequence, each atomic on its own. If the
+// step-down succeeded and only the handler's storage write failed, the node
+// is durably a Follower in the new term, so the step-down actions are still
+// returned alongside the error: a Leader's StopHeartbeatTimer and
+// ResetElectionTimer must reach the host, or it keeps a heartbeat timer for
+// a node that is no longer Leader and never arms an election timer.
 func (n *Node) Step(msg Message) ([]Action, error) {
 	if err := msg.Validate(); err != nil {
 		return nil, err
@@ -189,7 +202,7 @@ func (n *Node) Step(msg Message) ([]Action, error) {
 	case MsgRequestVote:
 		more, err := n.handleRequestVote(msg.From, msg.RequestVote)
 		if err != nil {
-			return nil, err
+			return actions, err
 		}
 		return append(actions, more...), nil
 	case MsgRequestVoteResponse:

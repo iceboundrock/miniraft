@@ -11,9 +11,11 @@ import (
 // handling, vote counting and the shared "higher term seen" step-down.
 //
 // Persistence rule used throughout: currentTerm and votedFor are written to
-// Storage before the in-memory copies change. If the write fails the node
-// returns the error with its state untouched and produces no actions, so
-// nothing a peer could observe ever runs ahead of what is durable.
+// Storage before the in-memory copies change. If the write fails the
+// transition returns the error with its state untouched and produces no
+// actions, so nothing a peer could observe ever runs ahead of what is
+// durable. Node.Step composes two such transitions (step-down, then the
+// handler) and returns the actions of whichever completed.
 
 // candidateLogUpToDate is the election restriction of §5.4.1: a voter grants
 // its vote only if the candidate's log is at least as up-to-date as its own.
@@ -72,6 +74,9 @@ func (n *Node) ElectionTimeout() ([]Action, error) {
 // vote. A single-node cluster already holds a majority and becomes Leader at
 // once.
 func (n *Node) becomeCandidate() ([]Action, error) {
+	if n.currentTerm == math.MaxUint64 {
+		return nil, ErrTermOverflow // term+1 would wrap to 0
+	}
 	term := n.currentTerm + 1
 	if err := n.storage.SaveTermVote(term, n.id); err != nil {
 		return nil, fmt.Errorf("raft: persist term %d vote: %w", term, err)

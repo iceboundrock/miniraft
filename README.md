@@ -107,10 +107,16 @@ Rules worth knowing because they are easy to get subtly wrong:
   anyone. The one exception is a Leader stepping down: it has no election
   timer running (it was stopped on election), so `becomeFollower` arms one
   and stops the heartbeat timer.
-- **Terms never decrease**: `becomeFollower(term)` panics on a lower term.
+- **Terms never decrease**: `becomeFollower(term)` panics on a lower term,
+  and a node whose `currentTerm` is already the maximum `Term` refuses to
+  start an election (`ErrTermOverflow`) rather than wrap to 0.
 - **Storage first**: `currentTerm`/`votedFor` are written before the
-  in-memory copies change; a storage error leaves the node untouched and
-  produces no actions.
+  in-memory copies change; a storage error leaves that transition untouched
+  and produces no actions from it. `Step` is a step-down followed by the
+  message handler, each atomic on its own: if the step-down persisted and
+  only the handler's write failed, the step-down actions are still returned
+  with the error, so a deposed Leader's `StopHeartbeatTimer` and
+  `ResetElectionTimer` reach the host.
 
 Heartbeats are not sent yet (issue #6), so a Leader does not suppress its
 followers' election timers and `HeartbeatTimeout()` still reports
