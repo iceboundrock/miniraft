@@ -51,9 +51,10 @@ type Network struct {
 
 	handlers     map[raft.NodeID]Handler
 	disconnected map[link]bool
-	partition    map[raft.NodeID]int // node -> group; nil when not partitioned
-	drops        map[link]int        // pending one-shot drops per link
-	duplicate    map[link]bool       // Duplicate hook, off by default
+	partition    map[raft.NodeID]int  // node -> group; nil when not partitioned
+	drops        map[link]int         // pending one-shot drops per link
+	duplicate    map[link]bool        // Duplicate hook, off by default
+	muted        map[raft.NodeID]bool // nodes whose AppendEntries are dropped
 }
 
 // NewNetwork creates an empty network. rng is the cluster's single random
@@ -74,6 +75,7 @@ func NewNetwork(clock *Clock, rng *rand.Rand, logger *slog.Logger, cfg NetworkCo
 		disconnected: make(map[link]bool),
 		drops:        make(map[link]int),
 		duplicate:    make(map[link]bool),
+		muted:        make(map[raft.NodeID]bool),
 	}
 }
 
@@ -101,6 +103,10 @@ func (n *Network) Send(msg raft.Message) {
 	}
 	if !n.Connected(msg.From, msg.To) {
 		log.Info("drop", "reason", "unreachable")
+		return
+	}
+	if msg.Type == raft.MsgAppendEntries && n.muted[msg.From] {
+		log.Info("drop", "reason", "heartbeats-stopped")
 		return
 	}
 	n.schedule(msg, log)
@@ -210,7 +216,8 @@ func (n *Network) Partition(groups [][]raft.NodeID) {
 }
 
 // Heal removes the partition and every directed disconnect (including those
-// made by Isolate). Pending one-shot drops and the Duplicate hook are kept.
+// made by Isolate). Pending one-shot drops, the Duplicate hook and muted
+// AppendEntries (StopHeartbeats) are kept.
 func (n *Network) Heal() {
 	n.partition = nil
 	n.disconnected = make(map[link]bool)
@@ -239,4 +246,18 @@ func (n *Network) SetDuplicate(from, to raft.NodeID, on bool) {
 		delete(n.duplicate, link{from, to})
 	}
 	n.logger.Info("duplicate", "from", from, "to", to, "on", on)
+}
+
+// SetMuteAppendEntries turns dropping of every AppendEntries sent by id on
+// or off. It simulates a Leader that has stopped sending heartbeats (a stalled
+// process) while it can still receive and reply, which is what makes its
+// followers time out and lets it learn about the new term afterwards.
+// Cluster.StopHeartbeats/ResumeHeartbeats are the test-facing names.
+func (n *Network) SetMuteAppendEntries(id raft.NodeID, on bool) {
+	if on {
+		n.muted[id] = true
+	} else {
+		delete(n.muted, id)
+	}
+	n.logger.Info("mute-append-entries", "node", id, "on", on)
 }

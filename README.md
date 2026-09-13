@@ -89,6 +89,12 @@ Follower ──ElectionTimeout──▶ Candidate: term+1, votedFor=self  [SaveT
         majority of RequestVoteResponse{granted} ──▶ Leader: nextIndex/matchIndex reset,
                                                              StopElectionTimer, ResetHeartbeatTimer
         any message with a higher term ──▶ Follower in that term, votedFor=none  [SaveTermVote]
+
+Leader ──HeartbeatTimeout──▶ AppendEntries(term, prevLogIndex, prevLogTerm, no entries) → every peer
+                             ResetHeartbeatTimer
+   follower: term < currentTerm → Success=false, timer untouched
+             else leaderID=sender, ResetElectionTimer,
+                  Success = log has (prevLogIndex, prevLogTerm)
 ```
 
 Rules worth knowing because they are easy to get subtly wrong:
@@ -113,7 +119,7 @@ Rules worth knowing because they are easy to get subtly wrong:
 - **Vote tally is a set** keyed by voter, so a duplicated response cannot
   count twice.
 - **Election timer resets** happen only when a node starts an election,
-  grants a vote, or (from issue #6) hears from the current Leader. A *denied*
+  grants a vote, or accepts an `AppendEntries` from the current Leader. A *denied*
   `RequestVote` never resets the timer, even when it carried a higher term —
   otherwise a node with a stale log could keep the cluster from electing
   anyone. The one exception is a Leader stepping down: it has no election
@@ -130,10 +136,41 @@ Rules worth knowing because they are easy to get subtly wrong:
   with the error, so a deposed Leader's `StopHeartbeatTimer` and
   `ResetElectionTimer` reach the host.
 
-Heartbeats are not sent yet (issue #6), so a Leader does not suppress its
-followers' election timers and `HeartbeatTimeout()` still reports
-`ErrNotImplemented`. Simulator tests therefore stop the clock once the
-election under test has completed; multi-round election runs are issue #17.
+### Heartbeats
+
+A Leader keeps its authority by broadcasting an empty `AppendEntries` to
+every peer each time its heartbeat timer fires (`HeartbeatTimeout()`), then
+re-arming the timer. `Config` requires `HeartbeatInterval <= ElectionTimeoutMin/3`,
+so a follower has to miss several heartbeats in a row before it starts an
+election. `internal/raft/replication.go` holds the receiver side:
+
+- **Stale term** (`Term < currentTerm`): reply `Success=false` with the
+  current term and change nothing — in particular the election timer is not
+  reset, so a deposed Leader cannot keep followers from timing out.
+- **Higher term**: `Step` has already made the node a Follower in that term
+  (persisted) before the handler runs.
+- **Same term, Candidate**: someone else won; become Follower (the vote for
+  itself stays, nothing to re-persist). A *Leader* receiving another
+  Leader's `AppendEntries` in its own term is an Election Safety violation
+  and is reported as an error with no state change.
+- **Recognize the Leader**: record `LeaderID` (visible in `Status`) and reset
+  the election timer. This happens on *every* accepted heartbeat, and even
+  when the consistency check below fails — a legitimate Leader whose log
+  differs from ours is still the Leader; the log is repaired by
+  replication, not by an election.
+- **Consistency check**: `raftLog.matches(PrevLogIndex, PrevLogTerm)`
+  decides `Success`; on success `MatchIndex = PrevLogIndex` (nothing was
+  appended). Index 0 always matches, so a heartbeat to an empty log
+  succeeds.
+
+The Leader logs each `AppendEntriesResponse` (`HeartbeatAck`) and, for now,
+does nothing else with it; `nextIndex`/`matchIndex` bookkeeping, carrying
+entries and `LeaderCommit` propagation are later issues (`AppendEntries`
+with entries currently returns `ErrNotImplemented` after honoring the
+heartbeat part). The simulator's `Cluster.StopHeartbeats(id)` drops that
+node's outgoing `AppendEntries` — and nothing else — to simulate a stalled
+Leader; `Cluster.RunFor(d)` advances the clock by a duration. Multi-round
+election runs are issue #17.
 
 ### Persistence
 

@@ -519,10 +519,7 @@ func TestHigherTermStepsDown(t *testing.T) {
 	t.Run("candidate on append entries", func(t *testing.T) {
 		n := newTestNode(t, testConfig("a", "b", "c"), &memStorage{})
 		electionTimeout(t, n)
-		msg := Message{From: "b", To: "a", Type: MsgAppendEntries, AppendEntries: &AppendEntries{Term: 4, LeaderID: "b"}}
-		if _, err := n.Step(msg); !errors.Is(err, ErrNotImplemented) {
-			t.Fatalf("AppendEntries handling: %v, want ErrNotImplemented", err)
-		}
+		step(t, n, heartbeat("b", "a", 4, 0, 0))
 		requireStatus(t, n, Follower, 4, None)
 	})
 }

@@ -254,6 +254,25 @@ func (c *Cluster) Run(until time.Duration) {
 	c.clock.Advance(until - c.clock.Now())
 }
 
+// RunFor executes every event in the next d of simulated time, then sets
+// the clock to Now()+d.
+func (c *Cluster) RunFor(d time.Duration) {
+	if d < 0 {
+		panic(fmt.Sprintf("simulator: RunFor(%v) with a negative duration", d))
+	}
+	c.Run(c.clock.Now() + d)
+}
+
+// StopHeartbeats silences node id as a Leader: every AppendEntries it sends
+// is dropped by the network until ResumeHeartbeats. Everything else (its
+// RequestVotes, messages to it, its followers' replies) still flows, so the
+// scenario is "the Leader stopped talking", not a partition. Undo with
+// ResumeHeartbeats.
+func (c *Cluster) StopHeartbeats(id raft.NodeID) { c.network.SetMuteAppendEntries(id, true) }
+
+// ResumeHeartbeats undoes StopHeartbeats.
+func (c *Cluster) ResumeHeartbeats(id raft.NodeID) { c.network.SetMuteAppendEntries(id, false) }
+
 // Step executes the next event; false when nothing is pending.
 func (c *Cluster) Step() bool { return c.clock.Step() }
 

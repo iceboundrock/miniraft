@@ -30,8 +30,8 @@ type Config struct {
 	ElectionTimeoutMin time.Duration
 	ElectionTimeoutMax time.Duration
 	// HeartbeatInterval is how often a Leader sends empty AppendEntries. It
-	// must be smaller than ElectionTimeoutMin (ideally by an order of
-	// magnitude), otherwise followers time out between heartbeats.
+	// must be at most ElectionTimeoutMin/3, so that a follower has to miss
+	// several heartbeats in a row before it times out.
 	HeartbeatInterval time.Duration
 	// Rand is the only source of randomness the core uses (election timeouts).
 	// It is required and has no default: a deterministic host seeds it
@@ -52,8 +52,10 @@ func (c *Config) validate() error {
 		return fmt.Errorf("raft: invalid election timeout range [%v, %v]", c.ElectionTimeoutMin, c.ElectionTimeoutMax)
 	case c.HeartbeatInterval <= 0:
 		return errors.New("raft: Config.HeartbeatInterval must be positive")
-	case c.HeartbeatInterval >= c.ElectionTimeoutMin:
-		return fmt.Errorf("raft: HeartbeatInterval %v must be smaller than ElectionTimeoutMin %v", c.HeartbeatInterval, c.ElectionTimeoutMin)
+	case c.HeartbeatInterval > c.ElectionTimeoutMin/3:
+		// Division rather than HeartbeatInterval*3 so a huge interval cannot
+		// overflow into passing the check.
+		return fmt.Errorf("raft: HeartbeatInterval %v must be at most a third of ElectionTimeoutMin %v", c.HeartbeatInterval, c.ElectionTimeoutMin)
 	case c.Rand == nil:
 		return errors.New("raft: Config.Rand is required")
 	}
@@ -77,6 +79,7 @@ type Status struct {
 	Role         Role
 	Term         Term
 	VotedFor     NodeID
+	LeaderID     NodeID // the Leader this node currently recognizes, or None
 	CommitIndex  Index
 	LastApplied  Index
 	LastLogIndex Index
@@ -95,6 +98,11 @@ type Node struct {
 	id    NodeID
 	peers []NodeID
 	role  Role
+	// leaderID is the Leader this node recognizes in currentTerm: itself
+	// while Leader, the sender of the last accepted AppendEntries while
+	// Follower, None otherwise (a Candidate, or a fresh term). It is
+	// volatile and only advisory (client redirection, diagnostics).
+	leaderID NodeID
 
 	// Persistent state (mirrored in storage; storage is written first).
 	currentTerm Term
@@ -166,6 +174,7 @@ func (n *Node) Status() Status {
 		Role:         n.role,
 		Term:         n.currentTerm,
 		VotedFor:     n.votedFor,
+		LeaderID:     n.leaderID,
 		CommitIndex:  n.commitIndex,
 		LastApplied:  n.lastApplied,
 		LastLogIndex: n.log.lastIndex(),
@@ -188,8 +197,7 @@ func (n *Node) Status() Status {
 //
 // The "higher term seen" rule (Figure 2, All Servers) then runs for every
 // message type: a message from a later term makes this node a Follower in
-// that term before the message itself is handled. AppendEntries handling is
-// implemented in a later issue.
+// that term before the message itself is handled.
 //
 // Step is two transitions in sequence, each atomic on its own. If the
 // step-down succeeded and only the handler's storage write failed, the node
@@ -224,15 +232,14 @@ func (n *Node) Step(msg Message) ([]Action, error) {
 		return append(actions, more...), nil
 	case MsgRequestVoteResponse:
 		return append(actions, n.handleRequestVoteResponse(msg.From, msg.RequestVoteResponse)...), nil
+	case MsgAppendEntries:
+		more, err := n.handleAppendEntries(msg.From, msg.AppendEntries)
+		return append(actions, more...), err
+	case MsgAppendEntriesResponse:
+		return append(actions, n.handleAppendEntriesResponse(msg.From, msg.AppendEntriesResponse)...), nil
 	default:
 		return actions, ErrNotImplemented
 	}
-}
-
-// HeartbeatTimeout tells the node its heartbeat timer fired.
-// Implemented in a later issue.
-func (n *Node) HeartbeatTimeout() ([]Action, error) {
-	return nil, ErrNotImplemented
 }
 
 // Propose asks the node, if it is Leader, to append cmd to the log.
