@@ -202,6 +202,42 @@ type Message struct {
 	AppendEntriesResponse *AppendEntriesResponse `json:"appendEntriesResponse,omitempty"`
 }
 
+// Clone returns a deep copy of m: every payload pointer is freshly
+// allocated and AppendEntries.Entries is copied with CloneEntries. A
+// transport that holds a message after Send returns (the simulator, which
+// delivers later and may deliver twice) must clone it, otherwise the sender
+// mutating its own copy, or one recipient mutating what it received, would
+// change a message still in flight. A real transport gets the same isolation
+// from serialization, so this is what keeps simulated and real delivery
+// semantics identical.
+//
+// Like every other log boundary, Clone canonicalizes a zero-length Entries
+// to nil (see CloneEntries). A heartbeat is an AppendEntries with
+// len(Entries) == 0; receivers must not distinguish nil from empty, and a
+// JSON transport sending "null" for one and "[]" for the other must be read
+// the same way.
+func (m Message) Clone() Message {
+	out := m
+	if m.RequestVote != nil {
+		rv := *m.RequestVote
+		out.RequestVote = &rv
+	}
+	if m.RequestVoteResponse != nil {
+		rvr := *m.RequestVoteResponse
+		out.RequestVoteResponse = &rvr
+	}
+	if m.AppendEntries != nil {
+		ae := *m.AppendEntries
+		ae.Entries = CloneEntries(m.AppendEntries.Entries)
+		out.AppendEntries = &ae
+	}
+	if m.AppendEntriesResponse != nil {
+		aer := *m.AppendEntriesResponse
+		out.AppendEntriesResponse = &aer
+	}
+	return out
+}
+
 // Term returns the term carried by the payload. Every Raft RPC and reply
 // carries the sender's term, which is what the "higher term ⇒ step down" rule
 // inspects.

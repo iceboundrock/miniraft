@@ -134,3 +134,74 @@ func TestMessageValidateAppendEntriesPayload(t *testing.T) {
 		}
 	}
 }
+
+// TestMessageClone: a clone shares nothing mutable with the original, so a
+// transport can hold it while the sender keeps mutating its own copy.
+// TestMessageCloneCanonicalizesEmptyEntries: Clone goes through CloneEntries,
+// which returns nil for any zero-length input, so an explicitly empty Entries
+// comes out nil. Heartbeats are recognised by len(Entries) == 0, never by
+// nil-ness, so the protocol cannot tell the difference — and nothing may
+// start to.
+func TestMessageCloneCanonicalizesEmptyEntries(t *testing.T) {
+	in := Message{From: "a", To: "b", Type: MsgAppendEntries, AppendEntries: &AppendEntries{Term: 3, LeaderID: "a", Entries: []LogEntry{}}}
+	out := in.Clone()
+	if out.AppendEntries.Entries != nil {
+		t.Fatalf("Clone() Entries = %#v, want nil", out.AppendEntries.Entries)
+	}
+	if len(out.AppendEntries.Entries) != 0 {
+		t.Fatalf("Clone() changed the entry count: %d", len(out.AppendEntries.Entries))
+	}
+}
+
+func TestMessageClone(t *testing.T) {
+	entries := []LogEntry{{Index: 8, Term: 3, Command: []byte("SET x 1")}}
+	cases := []Message{
+		{From: "a", To: "b", Type: MsgRequestVote, RequestVote: &RequestVote{Term: 3, CandidateID: "a", LastLogIndex: 7, LastLogTerm: 2}},
+		{From: "b", To: "a", Type: MsgRequestVoteResponse, RequestVoteResponse: &RequestVoteResponse{Term: 3, VoteGranted: true}},
+		{From: "a", To: "b", Type: MsgAppendEntries, AppendEntries: &AppendEntries{Term: 3, LeaderID: "a", PrevLogIndex: 7, PrevLogTerm: 2, Entries: entries, LeaderCommit: 6}},
+		{From: "b", To: "a", Type: MsgAppendEntriesResponse, AppendEntriesResponse: &AppendEntriesResponse{Term: 3, Success: true, MatchIndex: 8}},
+		{From: "a", To: "b", Type: MsgAppendEntries, AppendEntries: &AppendEntries{Term: 3, LeaderID: "a"}}, // heartbeat, nil Entries
+	}
+	for _, in := range cases {
+		t.Run(in.Type.String(), func(t *testing.T) {
+			out := in.Clone()
+			if !reflect.DeepEqual(in, out) {
+				t.Fatalf("Clone() = %+v, want equal to %+v", out, in)
+			}
+			switch in.Type {
+			case MsgRequestVote:
+				if out.RequestVote == in.RequestVote {
+					t.Fatal("RequestVote payload pointer is shared")
+				}
+				in.RequestVote.Term = 99
+			case MsgRequestVoteResponse:
+				if out.RequestVoteResponse == in.RequestVoteResponse {
+					t.Fatal("RequestVoteResponse payload pointer is shared")
+				}
+				in.RequestVoteResponse.Term = 99
+			case MsgAppendEntries:
+				if out.AppendEntries == in.AppendEntries {
+					t.Fatal("AppendEntries payload pointer is shared")
+				}
+				in.AppendEntries.Term = 99
+				if len(in.AppendEntries.Entries) > 0 {
+					in.AppendEntries.Entries[0].Command[0] = 'X'
+					in.AppendEntries.Entries[0].Term = 99
+				}
+			case MsgAppendEntriesResponse:
+				if out.AppendEntriesResponse == in.AppendEntriesResponse {
+					t.Fatal("AppendEntriesResponse payload pointer is shared")
+				}
+				in.AppendEntriesResponse.Term = 99
+			}
+			if out.Term() == 99 {
+				t.Fatal("mutating the original changed the clone's term")
+			}
+			if ae := out.AppendEntries; ae != nil && len(ae.Entries) > 0 {
+				if string(ae.Entries[0].Command) != "SET x 1" || ae.Entries[0].Term != 3 {
+					t.Fatalf("mutating the original changed the clone's entries: %+v", ae.Entries[0])
+				}
+			}
+		})
+	}
+}
