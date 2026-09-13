@@ -86,6 +86,11 @@ func (nopStateMachine) Apply(raft.LogEntry) ([]byte, error) { return nil, nil }
 // a fresh cluster has no pending events and Run returns immediately.
 func NewCluster(cfg Config) (*Cluster, error) {
 	cfg = cfg.withDefaults()
+	// NewNetwork panics on a bad range; a Config error belongs on this
+	// constructor's error path like every other invalid setting.
+	if cfg.MinLatency < 0 || cfg.MaxLatency < cfg.MinLatency {
+		return nil, fmt.Errorf("simulator: invalid latency range [%v, %v]", cfg.MinLatency, cfg.MaxLatency)
+	}
 	c := &Cluster{
 		cfg:   cfg,
 		clock: NewClock(),

@@ -190,6 +190,14 @@ func TestClusterRejectsInvalidConfig(t *testing.T) {
 	if _, err := NewCluster(Config{NodeIDs: []raft.NodeID{"a"}, HeartbeatInterval: time.Second}); err == nil {
 		t.Fatal("heartbeat >= election timeout accepted")
 	}
+	// Latency is validated here, as an error, rather than left to NewNetwork's
+	// panic: every invalid Config must come back through the error path.
+	if _, err := NewCluster(Config{NodeIDs: []raft.NodeID{"a"}, MinLatency: -time.Millisecond}); err == nil {
+		t.Fatal("negative MinLatency accepted")
+	}
+	if _, err := NewCluster(Config{NodeIDs: []raft.NodeID{"a"}, MinLatency: 5 * time.Millisecond, MaxLatency: time.Millisecond}); err == nil {
+		t.Fatal("MaxLatency < MinLatency accepted")
+	}
 }
 
 func TestClusterAddNodeRejectsDuplicateAndNil(t *testing.T) {
