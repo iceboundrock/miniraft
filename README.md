@@ -59,7 +59,7 @@ ordering Figure 2 requires ("updated on stable storage before responding to RPCs
 cmd/raftnode/           real node process (later issue)
 cmd/raftctl/            client CLI (later issue)
 internal/raft/          Raft core: types, log, node, actions
-internal/storage/       Storage implementations (MemoryStorage now, FileStorage later)
+internal/storage/       Storage implementations: MemoryStorage, FileStorage; storagetest conformance suite
 internal/statemachine/  State machine implementations (KV later)
 internal/simulator/     deterministic simulator: fake clock, event queue, network, cluster harness
 internal/transport/     real transport (HTTP, later issue)
@@ -71,6 +71,26 @@ docs/decisions/         architecture decision records
 | Persistent (via `Storage`) | Volatile | Leader-only volatile |
 |---|---|---|
 | `currentTerm`, `votedFor`, `log[]` | `commitIndex`, `lastApplied` | `nextIndex[]`, `matchIndex[]` |
+
+### Persistence
+
+`storage.FileStorage` (see [ADR 0003](docs/decisions/0003-file-storage-durability.md))
+keeps a node's persistent state in one directory of human-readable JSON:
+
+```
+<dir>/state.json   {"currentTerm":3,"votedFor":"b"}      replaced atomically on every SaveTermVote
+<dir>/log.jsonl    {"index":1,"term":1,"command":"AQ=="}  append-only NDJSON, fsync after every append;
+                   {"index":2,"term":3,"command":"Ag=="}  rewritten atomically by TruncateSuffix
+```
+
+Guaranteed: a write is durable when `SaveTermVote`/`AppendEntries` returns;
+`state.json` is never half-written; a partial trailing line left by a crash
+mid-append is discarded on `Open` (that append was never acknowledged). Not
+guaranteed: per-entry checksums, torn-write protection finer than one line,
+log rotation or compaction, a lock against two processes on one directory.
+Corruption before the last line is an error from `Open`, never repaired.
+`MemoryStorage` and `FileStorage` pass the same conformance suite
+(`go test ./internal/storage/ -run TestStorageConformance -v`).
 
 ## Development
 
