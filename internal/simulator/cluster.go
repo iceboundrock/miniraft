@@ -181,11 +181,15 @@ func (c *Cluster) Nodes() []*SimNode {
 func (c *Cluster) Now() time.Duration { return c.clock.Now() }
 
 // Run executes every event up to and including absolute time until, then
-// sets the clock to until. It is a no-op if until is in the past.
+// sets the clock to until. Run(Now()) fires events due right now; a past
+// until is a no-op.
 func (c *Cluster) Run(until time.Duration) {
-	if d := until - c.clock.Now(); d > 0 {
-		c.clock.Advance(d)
+	// Compare absolute times before subtracting: until-Now() wraps positive
+	// for a sufficiently old until, which would reach Advance and panic.
+	if until < c.clock.Now() {
+		return
 	}
+	c.clock.Advance(until - c.clock.Now())
 }
 
 // Step executes the next event; false when nothing is pending.

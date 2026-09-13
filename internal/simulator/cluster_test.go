@@ -2,6 +2,7 @@ package simulator
 
 import (
 	"errors"
+	"math"
 	"slices"
 	"strings"
 	"testing"
@@ -230,6 +231,30 @@ func TestClusterRunUntil(t *testing.T) {
 	}
 	if !c.RunUntil(func() bool { return true }, 50*time.Millisecond) || c.Now() != 100*time.Millisecond {
 		t.Fatalf("RunUntil with an already-true predicate must not move time: now=%v", c.Now())
+	}
+}
+
+// TestClusterRunBoundaries: Run(until) is inclusive, so Run(Now()) fires
+// events due right now (After(0) timers, zero-latency deliveries); a past
+// until is a no-op even when until-Now() would wrap positive.
+func TestClusterRunBoundaries(t *testing.T) {
+	c := newTestCluster(t, Config{Seed: 1})
+	fa := &fakeCore{id: "a"}
+	a := c.AddNode("a", fa)
+
+	c.Run(time.Millisecond)
+	a.Execute([]raft.Action{raft.ResetElectionTimer{Timeout: 0}})
+	c.Run(c.Now())
+	if fa.electionTimeouts != 1 {
+		t.Fatalf("Run(Now()) fired %d zero-delay timers, want 1", fa.electionTimeouts)
+	}
+
+	a.Execute([]raft.Action{raft.ResetElectionTimer{Timeout: 10 * time.Millisecond}})
+	for _, past := range []time.Duration{0, time.Millisecond - 1, math.MinInt64} {
+		c.Run(past)
+		if c.Now() != time.Millisecond || fa.electionTimeouts != 1 {
+			t.Fatalf("Run(%v): now=%v timeouts=%d; want a no-op at 1ms", past, c.Now(), fa.electionTimeouts)
+		}
 	}
 }
 
