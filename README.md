@@ -110,8 +110,10 @@ t=152 event=send from=a to=b type=RequestVote term=1 latency=5ms
 t=157 event=deliver from=a to=b type=RequestVote term=1
 ```
 
-Every simulator test logs `seed=<n>`. To replay a failure, construct the
-cluster with the same `Config.Seed` (or set it in the test) and run it again:
+Every test that builds a `Cluster` or a `Network` logs `seed=<n>` (the
+clock, event queue and timeline tests draw no random numbers and log none).
+To replay a failure, construct the cluster with the same `Config.Seed` (or
+set it in the test) and run it again:
 
 ```sh
 go test ./internal/simulator/ -run TestDeterministicReplay -v

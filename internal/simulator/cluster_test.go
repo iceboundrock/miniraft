@@ -201,12 +201,20 @@ func TestClusterRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
-func TestClusterAddNodeRejectsDuplicateAndNil(t *testing.T) {
+func TestClusterAddNodeRejectsDuplicateNilAndNone(t *testing.T) {
 	c := newTestCluster(t, Config{Seed: 1, NodeIDs: []raft.NodeID{"a"}})
 	assertPanics(t, "AddNode(a) twice", func() { c.AddNode("a", &fakeCore{id: "a"}) })
 	assertPanics(t, "AddNode(b, nil)", func() { c.AddNode("b", nil) })
-	if c.Node("b") != nil || len(c.Nodes()) != 1 {
+	assertPanics(t, "AddNode(None)", func() { c.AddNode(raft.None, &fakeCore{id: raft.None}) })
+	if c.Node("b") != nil || c.Node(raft.None) != nil || len(c.Nodes()) != 1 {
 		t.Fatal("a rejected AddNode must not register the node")
+	}
+	// The network must not have gained a handler either: a message to the
+	// empty address is still dropped as no-handler.
+	c.Network().Send(vote("a", raft.None, 1))
+	c.Run(time.Second)
+	if !timelineHas(c, "reason=no-handler") {
+		t.Fatal("a message to raft.None must be dropped as no-handler")
 	}
 }
 

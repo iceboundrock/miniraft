@@ -135,9 +135,14 @@ func NewCluster(cfg Config) (*Cluster, error) {
 
 // AddNode hosts core as node id: it becomes the network handler for id and
 // its actions are translated by the returned SimNode. NewCluster uses it for
-// raft.Nodes; tests use it for scripted cores. It panics on a duplicate id
-// or a nil core.
+// raft.Nodes; tests use it for scripted cores. It panics on raft.None, a
+// duplicate id or a nil core, leaving the cluster unchanged.
 func (c *Cluster) AddNode(id raft.NodeID, core Core) *SimNode {
+	// raft.None is "no node"; NewCluster rejects it via raft.NewNode, and a
+	// scripted core must not get to send or receive with an empty address.
+	if id == raft.None {
+		panic("simulator: AddNode with empty node id")
+	}
 	if _, dup := c.nodes[id]; dup {
 		panic(fmt.Sprintf("simulator: node %q already exists", id))
 	}
