@@ -137,6 +137,22 @@ func TestMessageValidateAppendEntriesPayload(t *testing.T) {
 
 // TestMessageClone: a clone shares nothing mutable with the original, so a
 // transport can hold it while the sender keeps mutating its own copy.
+// TestMessageCloneCanonicalizesEmptyEntries: Clone goes through CloneEntries,
+// which returns nil for any zero-length input, so an explicitly empty Entries
+// comes out nil. Heartbeats are recognised by len(Entries) == 0, never by
+// nil-ness, so the protocol cannot tell the difference — and nothing may
+// start to.
+func TestMessageCloneCanonicalizesEmptyEntries(t *testing.T) {
+	in := Message{From: "a", To: "b", Type: MsgAppendEntries, AppendEntries: &AppendEntries{Term: 3, LeaderID: "a", Entries: []LogEntry{}}}
+	out := in.Clone()
+	if out.AppendEntries.Entries != nil {
+		t.Fatalf("Clone() Entries = %#v, want nil", out.AppendEntries.Entries)
+	}
+	if len(out.AppendEntries.Entries) != 0 {
+		t.Fatalf("Clone() changed the entry count: %d", len(out.AppendEntries.Entries))
+	}
+}
+
 func TestMessageClone(t *testing.T) {
 	entries := []LogEntry{{Index: 8, Term: 3, Command: []byte("SET x 1")}}
 	cases := []Message{

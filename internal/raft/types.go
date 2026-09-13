@@ -210,6 +210,12 @@ type Message struct {
 // change a message still in flight. A real transport gets the same isolation
 // from serialization, so this is what keeps simulated and real delivery
 // semantics identical.
+//
+// Like every other log boundary, Clone canonicalizes a zero-length Entries
+// to nil (see CloneEntries). A heartbeat is an AppendEntries with
+// len(Entries) == 0; receivers must not distinguish nil from empty, and a
+// JSON transport sending "null" for one and "[]" for the other must be read
+// the same way.
 func (m Message) Clone() Message {
 	out := m
 	if m.RequestVote != nil {
