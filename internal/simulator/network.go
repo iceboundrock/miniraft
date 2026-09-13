@@ -195,7 +195,7 @@ func (n *Network) Isolate(id raft.NodeID) {
 // nobody; a node listed in two groups is a mistake and panics. A new
 // Partition replaces the previous one; directed disconnects stay in force
 // independently.
-func (n *Network) Partition(groups ...[]raft.NodeID) {
+func (n *Network) Partition(groups [][]raft.NodeID) {
 	partition := make(map[raft.NodeID]int)
 	for g, ids := range groups {
 		for _, id := range ids {

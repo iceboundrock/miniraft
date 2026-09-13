@@ -179,7 +179,7 @@ func TestNetworkDisconnectIsDirectional(t *testing.T) {
 // intra-group traffic flows, Heal restores everything.
 func TestNetworkPartitionAndHeal(t *testing.T) {
 	tn := newTestNetwork(t, 1, fixed(time.Millisecond), "a", "b", "c")
-	tn.net.Partition([]raft.NodeID{"a"}, []raft.NodeID{"b", "c"})
+	tn.net.Partition([][]raft.NodeID{{"a"}, {"b", "c"}})
 
 	tn.net.Send(vote("a", "b", 1))
 	tn.net.Send(vote("b", "a", 2))
@@ -203,7 +203,7 @@ func TestNetworkPartitionAndHeal(t *testing.T) {
 func TestNetworkPartitionRejectsNodeInTwoGroups(t *testing.T) {
 	tn := newTestNetwork(t, 1, fixed(time.Millisecond), "a", "b", "c")
 	assertPanics(t, "Partition with b twice", func() {
-		tn.net.Partition([]raft.NodeID{"a", "b"}, []raft.NodeID{"b", "c"})
+		tn.net.Partition([][]raft.NodeID{{"a", "b"}, {"b", "c"}})
 	})
 	if !tn.net.Connected("a", "c") {
 		t.Fatal("a rejected Partition must leave the network unpartitioned")
@@ -216,7 +216,7 @@ func TestNetworkPartitionLosesInFlightMessages(t *testing.T) {
 	tn := newTestNetwork(t, 1, fixed(10*time.Millisecond), "a", "b")
 	tn.net.Send(vote("a", "b", 1))
 	tn.clock.Advance(5 * time.Millisecond)
-	tn.net.Partition([]raft.NodeID{"a"}, []raft.NodeID{"b"})
+	tn.net.Partition([][]raft.NodeID{{"a"}, {"b"}})
 	tn.clock.Advance(10 * time.Millisecond)
 	assertTerms(t, tn.nodes["b"])
 	if !strings.Contains(tn.log.String(), "reason=unreachable-in-flight") {
