@@ -74,3 +74,20 @@ func TestEventQueueCancel(t *testing.T) {
 		t.Fatalf("Pop() = %+v, want c", ev)
 	}
 }
+
+// TestEventQueueCancelRejectsForeignEvent: an event belongs to the queue that
+// pushed it; cancelling it through another queue is a programming error and
+// must not touch either queue's accounting.
+func TestEventQueueCancelRejectsForeignEvent(t *testing.T) {
+	var q1, q2 EventQueue
+	ev := q2.Push(time.Millisecond, func() {})
+	q1.Push(time.Millisecond, func() {})
+
+	assertPanics(t, "q1.Cancel(q2 event)", func() { q1.Cancel(ev) })
+	if q1.Len() != 1 || q2.Len() != 1 {
+		t.Fatalf("Len() = %d, %d after rejected cancel; want 1, 1", q1.Len(), q2.Len())
+	}
+	if got := q2.Pop(); got != ev {
+		t.Fatalf("q2.Pop() = %+v, want the event (it must still be live)", got)
+	}
+}

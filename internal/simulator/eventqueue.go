@@ -17,7 +17,8 @@ type Event struct {
 	Seq uint64
 	Fn  func()
 
-	popped bool // set by Pop; a popped event can no longer be cancelled
+	owner  *EventQueue // the queue that pushed it; Cancel checks it
+	popped bool        // set by Pop; a popped event can no longer be cancelled
 }
 
 // EventQueue is a min-heap of events ordered by (At, Seq). It is the single
@@ -38,7 +39,7 @@ func (q *EventQueue) Push(at time.Duration, fn func()) *Event {
 		panic("simulator: EventQueue.Push with nil Fn")
 	}
 	q.nextSeq++
-	ev := &Event{At: at, Seq: q.nextSeq, Fn: fn}
+	ev := &Event{At: at, Seq: q.nextSeq, Fn: fn, owner: q}
 	heap.Push(&q.events, ev)
 	q.live++
 	return ev
@@ -67,9 +68,17 @@ func (q *EventQueue) Pop() *Event {
 }
 
 // Cancel marks ev so that Pop never returns it. It reports whether ev was
-// still pending (not yet popped or cancelled).
+// still pending (not yet popped or cancelled). ev must have been pushed on
+// q: cancelling an event through a different queue would corrupt both
+// queues' live counts, so it panics instead.
 func (q *EventQueue) Cancel(ev *Event) bool {
-	if ev == nil || ev.popped || ev.Fn == nil {
+	if ev == nil {
+		return false
+	}
+	if ev.owner != q {
+		panic("simulator: EventQueue.Cancel with an event from another queue")
+	}
+	if ev.popped || ev.Fn == nil {
 		return false
 	}
 	ev.Fn = nil
