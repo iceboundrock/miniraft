@@ -240,10 +240,12 @@ returns as soon as the entry is in the Leader's own log.
 In the simulator, `Cluster.Propose(cmd)` routes to `Leader()` (an error
 when there is none), `SimNode.Propose(cmd)` targets one node — both return
 the client's answer rather than recording it in `Errors()` — and
-`Cluster.LogsConverged()` is the usual `RunUntil` predicate: every node holds
-exactly the Leader's persisted log. It counts every node regardless of the
-network, so it never reports an isolated Leader as converged; a partition
-test that only cares about one side compares those logs itself.
+`Cluster.LogsConverged()` is the usual `RunUntil` predicate: every node
+connected to the Leader (link open in both directions) holds exactly the
+Leader's persisted log, and those nodes form a majority. Nodes cut off from
+the Leader are ignored, so a partition test can run until the majority side
+agrees while an isolated node is still divergent; the majority rule keeps a
+Leader that cannot reach a quorum from counting as converged.
 `SimNode.Log()` reads the log back from storage. A node whose
 `MemoryStorage` was closed by a test answers every write with
 `storage.ErrClosed`; the invariant checker skips its log until it is
