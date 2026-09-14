@@ -241,14 +241,17 @@ In the simulator, `Cluster.Propose(cmd)` routes to `Leader()` (an error
 when there is none), `SimNode.Propose(cmd)` targets one node — both return
 the client's answer rather than recording it in `Errors()` — and
 `Cluster.LogsConverged()` is the usual `RunUntil` predicate: every node
-connected to the Leader (link open in both directions) holds exactly the
-Leader's persisted log. Nodes cut off from the Leader are ignored, so a
-partition test can run until the Leader's side agrees while an isolated
-node is still divergent; that side need not be a quorum, because the
-predicate is about replication rather than commit. It is never vacuous: a
-Leader that has peers but reaches none of them reads false, so `RunUntil`
-does not return before anything was replicated (a single-node cluster,
-having no followers, is converged as soon as it has a Leader).
+connected to the Leader holds exactly the Leader's persisted log.
+"Connected" follows the direction replication flows: the Leader -> node
+link is open, whether or not the node can answer (a follower whose replies
+are lost still receives and persists what the Leader sends). Nodes the
+Leader cannot send to are ignored, so a partition test can run until the
+Leader's side agrees while an isolated node is still divergent; that side
+need not be a quorum, because the predicate is about replication rather
+than commit. It is never vacuous: a Leader that has peers but reaches none
+of them reads false, so `RunUntil` does not return before anything was
+replicated (a single-node cluster, having no followers, is converged as
+soon as it has a Leader).
 `SimNode.Log()` reads the log back from storage. A node whose
 `MemoryStorage` was closed by a test answers every write with
 `storage.ErrClosed`; the invariant checker skips its log until it is

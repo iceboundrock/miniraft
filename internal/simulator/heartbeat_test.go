@@ -29,7 +29,8 @@ func countTimeline(c *Cluster, substr string) int {
 // electLeader runs c until an agreed Leader exists and returns it.
 func electLeader(t *testing.T, c *Cluster) *SimNode {
 	t.Helper()
-	if !c.RunUntil(electionAgreed(c), 2*time.Second) {
+	// RunUntil takes an absolute deadline; anchor the 2s window at now.
+	if !c.RunUntil(electionAgreed(c), c.Now()+2*time.Second) {
 		t.Fatalf("no agreed Leader within 2s: roles=%v", c.Roles())
 	}
 	return c.Leader()

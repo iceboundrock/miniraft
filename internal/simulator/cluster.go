@@ -253,8 +253,13 @@ func (c *Cluster) Propose(cmd []byte) (raft.Index, error) {
 
 // LogsConverged reports whether every node connected to the Leader holds
 // exactly the Leader's persisted log. "Connected" is the set replication
-// can actually reach: nodes whose link to the Leader is open in both
-// directions. Nodes cut off from the Leader are ignored, so a partition
+// can actually reach, and replication flows one way: a node is connected
+// when the Leader -> node link is open, whether or not the node's link back
+// to the Leader is. A follower that cannot answer still receives every
+// AppendEntries and persists what the Leader sends, so it is compared like
+// any other; the reverse link only decides whether the Leader learns of it
+// (matchIndex, nextIndex rollback), which is not what this predicate
+// observes. Nodes the Leader cannot send to are ignored, so a partition
 // test can run "until the Leader's side agrees" while a divergent isolated
 // node is left behind (it converges once the network heals). The Leader's
 // side need not be a quorum: this predicate is about replication, which
@@ -281,7 +286,7 @@ func (c *Cluster) LogsConverged() bool {
 	followers := 0
 	for _, id := range c.ids {
 		n := c.nodes[id]
-		if n == leader || !c.network.Connected(leader.id, id) || !c.network.Connected(id, leader.id) {
+		if n == leader || !c.network.Connected(leader.id, id) {
 			continue
 		}
 		followers++

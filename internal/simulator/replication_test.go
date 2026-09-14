@@ -19,12 +19,15 @@ import (
 // suffixes, duplicates are harmless, and the Log Matching / Leader
 // Append-Only invariants hold throughout.
 
-// requireConverged runs c until every node connected to the Leader holds
-// the Leader's log (see Cluster.LogsConverged) and returns the Leader. Every
-// caller runs it on a healed network, where that means every node.
+// requireConverged runs c for at most within of simulated time from now,
+// until every node connected to the Leader holds the Leader's log (see
+// Cluster.LogsConverged), and returns the Leader. Every caller runs it on a
+// healed network, where that means every node. RunUntil takes an absolute
+// deadline, so the window is anchored at Now(): a call made after the
+// simulation has already passed within must still wait.
 func requireConverged(t *testing.T, c *Cluster, within time.Duration) *SimNode {
 	t.Helper()
-	if !c.RunUntil(c.LogsConverged, within) {
+	if !c.RunUntil(c.LogsConverged, c.Now()+within) {
 		var logs []string
 		for _, n := range c.Nodes() {
 			logs = append(logs, fmt.Sprintf("%s: %v", n.ID(), terms(n.Log())))
@@ -40,6 +43,16 @@ func terms(log []raft.LogEntry) []raft.Term {
 	out := make([]raft.Term, len(log))
 	for i, e := range log {
 		out[i] = e.Term
+	}
+	return out
+}
+
+// pairs turns a Figure 7 term list into the (index, term) pairs preloaded
+// takes: entry i+1 has terms[i].
+func pairs(terms []raft.Term) [][2]uint64 {
+	var out [][2]uint64
+	for i, term := range terms {
+		out = append(out, [2]uint64{uint64(i + 1), uint64(term)})
 	}
 	return out
 }
@@ -101,6 +114,15 @@ func TestProposeReplicatesToFollowers(t *testing.T) {
 	if !timelineHas(c, "event=Propose node="+string(leader.ID())) {
 		t.Fatal("timeline missing Propose")
 	}
+	// requireConverged's window is relative to now: once the simulation is
+	// past the window's length in absolute time, the helper must still run
+	// the cluster rather than evaluate the predicate once and give up.
+	c.RunFor(time.Second)
+	proposeAll(t, c, "SET w 4")
+	requireConverged(t, c, time.Second)
+	for _, n := range c.Nodes() {
+		requireLogEquals(t, n, "SET x 1", "SET y 2", "SET z 3", "SET w 4")
+	}
 }
 
 // TestFollowerCatchUp: a follower cut off while the Leader accepts
@@ -161,15 +183,15 @@ func sendsTo(c *Cluster, leader, peer raft.NodeID) (prevIndexes []int, acked boo
 // whole missing suffix.
 func TestNextIndexRollback(t *testing.T) {
 	const k = 5
-	var pairs [][2]uint64
+	var prefix [][2]uint64
 	for i := uint64(1); i <= k; i++ {
-		pairs = append(pairs, [2]uint64{i, 1})
+		prefix = append(prefix, [2]uint64{i, 1})
 	}
 	c := newTestCluster(t, Config{Seed: 1, NodeIDs: []raft.NodeID{"a", "b", "c"},
 		// Fixed 1ms latency so that the whole walk-back fits between two
 		// heartbeats and no heartbeat interleaves with the probes.
 		MinLatency: time.Millisecond, MaxLatency: time.Millisecond,
-		Stores: map[raft.NodeID]*storage.MemoryStorage{"a": preloaded(t, 1, raft.None, pairs...)}})
+		Stores: map[raft.NodeID]*storage.MemoryStorage{"a": preloaded(t, 1, raft.None, prefix...)}})
 	c.Node("a").ForceElectionTimeout()
 	leader := requireConverged(t, c, time.Second)
 	if leader.ID() != "a" {
@@ -307,13 +329,6 @@ func TestFigure7Scenarios(t *testing.T) {
 		{"e: divergent old term", []raft.Term{1, 1, 1, 4, 4, 4, 4}, 1},
 		{"f: long divergent suffix", []raft.Term{1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3}, 1},
 	}
-	pairs := func(terms []raft.Term) [][2]uint64 {
-		var out [][2]uint64
-		for i, term := range terms {
-			out = append(out, [2]uint64{uint64(i + 1), uint64(term)})
-		}
-		return out
-	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c := newTestCluster(t, Config{Seed: 1, NodeIDs: []raft.NodeID{"a", "b", "c"},
@@ -396,13 +411,6 @@ func TestLogsConverged(t *testing.T) {
 func TestLogsConvergedIgnoresIsolatedDivergentNode(t *testing.T) {
 	reference := []raft.Term{1, 1, 1, 4, 4, 5, 5, 6, 6}
 	divergent := []raft.Term{1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3}
-	pairs := func(terms []raft.Term) [][2]uint64 {
-		var out [][2]uint64
-		for i, term := range terms {
-			out = append(out, [2]uint64{uint64(i + 1), uint64(term)})
-		}
-		return out
-	}
 	c := newTestCluster(t, Config{Seed: 1, NodeIDs: []raft.NodeID{"a", "b", "c"},
 		Stores: map[raft.NodeID]*storage.MemoryStorage{
 			"a": preloaded(t, 7, raft.None, pairs(reference)...),
@@ -514,6 +522,101 @@ func TestLogsConvergedMinorityComponent(t *testing.T) {
 	requireConverged(t, c, time.Second)
 	for _, n := range c.Nodes() {
 		requireLogEquals(t, n, "SET x 1")
+	}
+}
+
+// TestLogsConvergedForwardLink: "connected" is defined by the direction
+// replication flows, Leader -> follower. A follower whose link back to the
+// Leader is down still receives every AppendEntries and persists the
+// Leader's log, so it is compared like any other follower: the predicate
+// must not read true while it is behind merely because the Leader never
+// hears back from it. The first AppendEntries to that follower is lost so
+// that the other follower holds the entry strictly earlier; the Leader,
+// which never learns anything about the one-way follower, resends the same
+// suffix with its next heartbeat.
+func TestLogsConvergedForwardLink(t *testing.T) {
+	c := newTestCluster(t, Config{Seed: 1, NodeIDs: []raft.NodeID{"a", "b", "c"}})
+	leader := electLeader(t, c)
+	var oneWay, twoWay *SimNode
+	for _, n := range c.Nodes() {
+		switch {
+		case n == leader:
+		case oneWay == nil:
+			oneWay = n
+		default:
+			twoWay = n
+		}
+	}
+	c.Network().Disconnect(oneWay.ID(), leader.ID())
+	c.Network().Drop(leader.ID(), oneWay.ID())
+	proposeAll(t, c, "SET x 1")
+	c.RunFor(2 * DefaultLatency)
+	requireLogEquals(t, twoWay, "SET x 1")
+	requireLogEquals(t, oneWay)
+	if c.LogsConverged() {
+		t.Fatalf("LogsConverged while %s, which the Leader can send to, is still behind", oneWay.ID())
+	}
+	if !c.RunUntil(c.LogsConverged, c.Now()+2*DefaultHeartbeatInterval) {
+		t.Fatalf("%s did not receive the resent entry over the forward link", oneWay.ID())
+	}
+	requireLogEquals(t, oneWay, "SET x 1")
+	if timelineHas(c, fmt.Sprintf("event=AppendEntriesAck node=%s term=%d role=Leader peer=%s",
+		leader.ID(), leader.Status().Term, oneWay.ID())) {
+		t.Fatalf("the Leader heard from %s although its link to the Leader is down", oneWay.ID())
+	}
+	if countTimeline(c, "event=BecameLeader") != 1 {
+		t.Fatal("the one-way follower started an election; it should have kept receiving heartbeats")
+	}
+	requireNoErrors(t, c)
+}
+
+// TestLogsConvergedForwardLinkDivergent: the other half of the forward-link
+// rule. A divergent follower whose rejections never reach the Leader cannot
+// be repaired (the Leader's nextIndex for it never moves), yet it is still
+// "connected" for replication and its log still differs, so the predicate
+// stays false; the other follower agreeing with the Leader is not
+// convergence. Reconnecting the reverse link lets the rollback proceed.
+func TestLogsConvergedForwardLinkDivergent(t *testing.T) {
+	reference := []raft.Term{1, 1, 1, 4, 4, 5, 5, 6, 6}
+	divergent := []raft.Term{1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3}
+	c := newTestCluster(t, Config{Seed: 1, NodeIDs: []raft.NodeID{"a", "b", "c"},
+		Stores: map[raft.NodeID]*storage.MemoryStorage{
+			"a": preloaded(t, 7, raft.None, pairs(reference)...),
+			"b": preloaded(t, 7, raft.None, pairs(divergent)...),
+			"c": preloaded(t, 7, raft.None, pairs(reference)...),
+		}})
+	c.Network().Disconnect("b", "a")
+	c.Node("a").ForceElectionTimeout()
+	if !c.RunUntil(hasLeader(c), time.Second) {
+		t.Fatal("no Leader elected")
+	}
+	if leader := c.Leader(); leader.ID() != "a" {
+		t.Fatalf("Leader = %s, want a", leader.ID())
+	}
+	proposeAll(t, c, "SET x 1")
+	if c.RunUntil(c.LogsConverged, c.Now()+4*DefaultHeartbeatInterval) {
+		t.Fatal("LogsConverged although b, which the Leader can send to, is still divergent")
+	}
+	want := append(slices.Clone(reference), 8)
+	if got := terms(c.Node("c").Log()); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("c log terms = %v, want %v", got, want)
+	}
+	if got := terms(c.Node("b").Log()); fmt.Sprint(got) != fmt.Sprint(divergent) {
+		t.Fatalf("b log terms = %v, want its divergent log %v untouched", got, divergent)
+	}
+	if countTimeline(c, "event=AppendEntriesReject node=b ") == 0 {
+		t.Fatal("b never received a probe over the forward link")
+	}
+	if timelineHas(c, "event=AppendEntriesAck node=a term=8 role=Leader peer=b") {
+		t.Fatal("the Leader heard from b although b's link to it is down")
+	}
+	c.Network().Reconnect("b", "a")
+	requireConverged(t, c, 2*time.Second)
+	if got := terms(c.Node("b").Log()); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("b log terms after reconnect = %v, want %v", got, want)
+	}
+	if got := countTimeline(c, "event=TruncateSuffix node=b "); got != 1 {
+		t.Fatalf("b truncated %d times, want 1", got)
 	}
 }
 
