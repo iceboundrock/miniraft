@@ -8,9 +8,26 @@ import (
 	"time"
 )
 
-// ErrNotImplemented is returned by protocol entry points that a later issue
-// implements. It exists so the skeleton compiles and is testable now.
-var ErrNotImplemented = errors.New("raft: not implemented")
+// ErrNotLeader is returned by Propose on a node that is not the Leader. The
+// concrete error is a *NotLeaderError, which carries the Leader hint.
+var ErrNotLeader = errors.New("raft: not the leader")
+
+// NotLeaderError is the error Propose returns on a non-Leader. LeaderID is
+// the Leader this node currently recognizes, so a client can be redirected,
+// or None when it knows of no Leader (a Candidate, or a fresh term). It
+// unwraps to ErrNotLeader so callers can test errors.Is(err, ErrNotLeader).
+type NotLeaderError struct {
+	LeaderID NodeID
+}
+
+func (e *NotLeaderError) Error() string {
+	if e.LeaderID == None {
+		return ErrNotLeader.Error() + " (leader unknown)"
+	}
+	return fmt.Sprintf("%v (leader is %s)", ErrNotLeader, e.LeaderID)
+}
+
+func (e *NotLeaderError) Unwrap() error { return ErrNotLeader }
 
 // ErrTermOverflow is returned when starting an election would advance
 // currentTerm past the maximum Term. Wrapping to 0 would violate Term
@@ -236,14 +253,37 @@ func (n *Node) Step(msg Message) ([]Action, error) {
 		more, err := n.handleAppendEntries(msg.From, msg.AppendEntries)
 		return append(actions, more...), err
 	case MsgAppendEntriesResponse:
-		return append(actions, n.handleAppendEntriesResponse(msg.From, msg.AppendEntriesResponse)...), nil
+		more, err := n.handleAppendEntriesResponse(msg.From, msg.AppendEntriesResponse)
+		return append(actions, more...), err
 	default:
-		return actions, ErrNotImplemented
+		// Unreachable: Validate rejects unknown types before the step-down.
+		return actions, fmt.Errorf("raft: unhandled message type %s", msg.Type)
 	}
 }
 
-// Propose asks the node, if it is Leader, to append cmd to the log.
-// Implemented in a later issue.
-func (n *Node) Propose(cmd []byte) ([]Action, error) {
-	return nil, ErrNotImplemented
+// Propose asks the node, if it is Leader, to append cmd to the log (§5.3).
+// It returns the index the entry was assigned and the AppendEntries that
+// start replicating it; the entry is only proposed, not committed — the
+// host learns of commit and apply through later actions. A non-Leader
+// returns a *NotLeaderError with no actions.
+//
+// The entry is written to Storage before it exists in memory, like every
+// other persistent-state change: a failed append leaves the log unchanged,
+// returns the error and sends nothing.
+func (n *Node) Propose(cmd []byte) (Index, []Action, error) {
+	if n.role != Leader {
+		return 0, nil, &NotLeaderError{LeaderID: n.leaderID}
+	}
+	entry := LogEntry{Index: n.log.lastIndex() + 1, Term: n.currentTerm, Command: cmd}
+	if err := n.storage.AppendEntries([]LogEntry{entry}); err != nil {
+		return 0, nil, fmt.Errorf("raft: persist entry %d: %w", entry.Index, err)
+	}
+	n.log.append(entry)
+	n.matchIndex[n.id] = entry.Index
+	n.logger.Info("Propose", "term", n.currentTerm, "role", n.role, "index", entry.Index)
+	actions := make([]Action, 0, len(n.peers))
+	for _, p := range n.peers {
+		actions = append(actions, n.sendAppendEntries(p))
+	}
+	return entry.Index, actions, nil
 }

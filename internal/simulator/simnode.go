@@ -17,7 +17,7 @@ type Core interface {
 	Step(msg raft.Message) ([]raft.Action, error)
 	ElectionTimeout() ([]raft.Action, error)
 	HeartbeatTimeout() ([]raft.Action, error)
-	Propose(cmd []byte) ([]raft.Action, error)
+	Propose(cmd []byte) (raft.Index, []raft.Action, error)
 	Status() raft.Status
 }
 
@@ -49,6 +49,20 @@ func (n *SimNode) ID() raft.NodeID { return n.id }
 
 // Status returns the core's observable state.
 func (n *SimNode) Status() raft.Status { return n.core.Status() }
+
+// Log returns the node's persisted log, read back from Storage, or nil for
+// a node without one (a scripted core). Tests and the invariant checker
+// compare what nodes have actually written, not what a core claims.
+func (n *SimNode) Log() []raft.LogEntry {
+	if n.Storage == nil {
+		return nil
+	}
+	st, err := n.Storage.Load()
+	if err != nil {
+		panic(fmt.Sprintf("simulator: node %s: load storage: %v", n.id, err))
+	}
+	return st.Entries
+}
 
 // ElectionTimerArmed reports whether an election timer is pending.
 func (n *SimNode) ElectionTimerArmed() bool { return n.electionTimer != 0 }
@@ -82,10 +96,24 @@ func (n *SimNode) HandleMessage(msg raft.Message) {
 	n.drive(func() ([]raft.Action, error) { return n.core.Step(msg) })
 }
 
-// Propose submits a client command to the core.
-func (n *SimNode) Propose(cmd []byte) {
-	n.logger.Info("Propose", "command", string(cmd))
-	n.drive(func() ([]raft.Action, error) { return n.core.Propose(cmd) })
+// Propose submits a client command to the core and returns the index the
+// core assigned to it. Unlike the other inputs, the error is returned to the
+// caller instead of being recorded in Errors(): a rejected proposal
+// (raft.ErrNotLeader on a follower) is the protocol answering a client, not
+// the core misbehaving.
+func (n *SimNode) Propose(cmd []byte) (raft.Index, error) {
+	n.logger.Info("ClientPropose", "command", string(cmd))
+	var idx raft.Index
+	var err error
+	n.drive(func() ([]raft.Action, error) {
+		var actions []raft.Action
+		idx, actions, err = n.core.Propose(cmd)
+		return actions, nil
+	})
+	if err != nil {
+		n.logger.Info("ClientProposeRejected", "err", err)
+	}
+	return idx, err
 }
 
 // drive calls one core input, records an error if it returns one, executes

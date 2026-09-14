@@ -49,9 +49,9 @@ func (f *fakeCore) HeartbeatTimeout() ([]raft.Action, error) {
 	return nil, f.err
 }
 
-func (f *fakeCore) Propose(cmd []byte) ([]raft.Action, error) {
+func (f *fakeCore) Propose(cmd []byte) (raft.Index, []raft.Action, error) {
 	f.proposals = append(f.proposals, cmd)
-	return nil, f.err
+	return raft.Index(len(f.proposals)), nil, f.err
 }
 
 func (f *fakeCore) Start() []raft.Action {
@@ -134,7 +134,9 @@ func TestClusterTranslatesActions(t *testing.T) {
 	if !timelineHas(c, "event=Applied node=a index=3 term=2") {
 		t.Fatal("timeline missing Applied event")
 	}
-	a.Propose([]byte("SET x 1"))
+	if idx, err := a.Propose([]byte("SET x 1")); idx != 1 || err != nil {
+		t.Fatalf("Propose = (%d, %v), want (1, nil)", idx, err)
+	}
 	if len(fa.proposals) != 1 || string(fa.proposals[0]) != "SET x 1" {
 		t.Fatalf("proposals = %q", fa.proposals)
 	}
