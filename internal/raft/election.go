@@ -84,6 +84,7 @@ func (n *Node) becomeCandidate() ([]Action, error) {
 	n.currentTerm = term
 	n.votedFor = n.id
 	n.role = Candidate
+	n.leaderID = None
 	n.votes = map[NodeID]bool{n.id: true}
 	n.logger.Info("BecameCandidate", "term", n.currentTerm, "role", n.role)
 
@@ -108,11 +109,11 @@ func (n *Node) becomeCandidate() ([]Action, error) {
 
 // becomeLeader completes a won election: reinitialize the per-peer
 // replication state (Figure 2, "Volatile state on leaders"), stop the
-// election timer and start the heartbeat timer. Heartbeats themselves are
-// sent by a later issue; until then the Leader is only observable through
-// Status.
+// election timer and start the heartbeat timer. The first heartbeat goes
+// out when that timer fires (HeartbeatTimeout).
 func (n *Node) becomeLeader() []Action {
 	n.role = Leader
+	n.leaderID = n.id
 	n.votes = nil
 	next := n.log.lastIndex() + 1
 	for _, p := range n.peers {
@@ -126,16 +127,19 @@ func (n *Node) becomeLeader() []Action {
 // becomeFollower is the shared "saw a higher term" transition (Figure 2,
 // "Rules for Servers / All Servers"). It adopts term, clears the vote and
 // persists both when the term actually changes; with an equal term it only
-// changes the role (a Candidate yielding to the Leader of its own term, from
-// a later issue).
+// changes the role (a Candidate yielding to the Leader of its own term). The
+// recognized leaderID is forgotten with the old term; the caller records the
+// new one if the message that caused the step-down came from a Leader.
 //
 // Timer policy: a Leader runs no election timer, so stepping down from
 // Leader must arm one (and stop the heartbeat timer), otherwise a Leader
 // deposed by a RequestVote it *denies* would never time out again. A
 // Follower or Candidate already has a timer running and it is deliberately
 // left alone: the election timer is reset only when starting an election,
-// granting a vote, or (later issue) hearing from the current Leader, so a
-// disruptive candidate cannot postpone everyone's timeouts.
+// granting a vote, or accepting AppendEntries from the current Leader, so a
+// disruptive candidate cannot postpone everyone's timeouts. (A Candidate
+// stepping down to the Leader of its own term gets its reset from the
+// AppendEntries handler, like any other valid heartbeat.)
 //
 // term < currentTerm is a programming error (terms never decrease) and
 // panics rather than silently corrupting the state.
@@ -156,6 +160,7 @@ func (n *Node) becomeFollower(term Term) ([]Action, error) {
 	if grew {
 		n.currentTerm = term
 		n.votedFor = None
+		n.leaderID = None
 	}
 	n.role = Follower
 	n.votes = nil

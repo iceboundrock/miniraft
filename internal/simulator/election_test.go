@@ -10,12 +10,10 @@ import (
 	"github.com/iceboundrock/miniraft/internal/storage"
 )
 
-// Leader election tests. Heartbeats are not implemented yet (issue #6), so
-// a Leader does not suppress its followers' election timers and its own
-// heartbeat timer fires HeartbeatTimeout, which the core still reports as
-// ErrNotImplemented. Every test therefore stops the clock as soon as the
-// election it is interested in has completed, and asserts that no core
-// error was recorded on the way. Multi-round election runs are issue #17.
+// Leader election tests. Each test stops the clock as soon as the election
+// it is interested in has completed and asserts that no core error was
+// recorded on the way; longer runs with heartbeats are in heartbeat_test.go
+// and multi-round election runs are issue #17.
 
 // hasLeader reports whether c currently has a unique Leader.
 func hasLeader(c *Cluster) func() bool {
