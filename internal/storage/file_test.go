@@ -282,3 +282,221 @@ func TestFileStorageTruncateSucceedsWhenOldHandleCloseFails(t *testing.T) {
 		t.Fatalf("after reopen Entries = %+v, want %+v", s.Entries, want)
 	}
 }
+
+// errInjected is the failure a faultyLogFile or a hooked syncDir reports.
+var errInjected = errors.New("injected fault")
+
+// faultyLogFile wraps the real append handle so that a test can make Write,
+// Sync or Truncate fail, which no real filesystem does on request. A nil
+// hook passes the call through to the file.
+type faultyLogFile struct {
+	*os.File
+	write    func(f *os.File, p []byte) (int, error)
+	sync     func(f *os.File) error
+	truncate func(f *os.File, size int64) error
+}
+
+func (f *faultyLogFile) Write(p []byte) (int, error) {
+	if f.write != nil {
+		return f.write(f.File, p)
+	}
+	return f.File.Write(p)
+}
+
+func (f *faultyLogFile) Sync() error {
+	if f.sync != nil {
+		return f.sync(f.File)
+	}
+	return f.File.Sync()
+}
+
+func (f *faultyLogFile) Truncate(size int64) error {
+	if f.truncate != nil {
+		return f.truncate(f.File, size)
+	}
+	return f.File.Truncate(size)
+}
+
+// injectFaults swaps fs's append handle for a faultyLogFile (white-box) and
+// returns it so the test can arm and clear faults.
+func injectFaults(fs *FileStorage) *faultyLogFile {
+	ff := &faultyLogFile{File: fs.logFile.(*os.File)}
+	fs.logFile = ff
+	return ff
+}
+
+// hookSyncDir makes every directory sync fail with errInjected until the
+// returned function restores the real one.
+func hookSyncDir(t *testing.T) (restore func()) {
+	t.Helper()
+	real := syncDir
+	syncDir = func(string) error { return errInjected }
+	restore = func() { syncDir = real }
+	t.Cleanup(restore)
+	return restore
+}
+
+func logLines(t *testing.T, dir string) int {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, logFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bytes.Count(data, []byte("\n"))
+}
+
+func TestFileStorageFailedAppendIsRolledBackAndRetryable(t *testing.T) {
+	// The core retries a failed append with the same suffix (a follower
+	// answers nothing, so the Leader resends). The retry must produce
+	// exactly one copy of the batch whatever the failed attempt left on
+	// disk: nothing, a partial line, or every line with the fsync missing.
+	first := storagetest.Entries([2]uint64{1, 1}, [2]uint64{2, 1})
+	batch := storagetest.Entries([2]uint64{3, 2}, [2]uint64{4, 2})
+	want := append(append([]raft.LogEntry(nil), first...), batch...)
+	faults := map[string]func(ff *faultyLogFile){
+		"nothing written": func(ff *faultyLogFile) {
+			ff.write = func(*os.File, []byte) (int, error) { return 0, errInjected }
+		},
+		"short write": func(ff *faultyLogFile) {
+			ff.write = func(f *os.File, p []byte) (int, error) {
+				n, _ := f.Write(p[:len(p)/2]) // one full line and part of the next
+				return n, errInjected
+			}
+		},
+		"written, sync fails once": func(ff *faultyLogFile) {
+			ff.sync = func(f *os.File) error {
+				ff.sync = nil // the rollback's own sync goes through
+				return errInjected
+			}
+		},
+	}
+	for name, arm := range faults {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			fs := mustOpen(t, dir)
+			if err := fs.AppendEntries(first); err != nil {
+				t.Fatal(err)
+			}
+			ff := injectFaults(fs)
+			arm(ff)
+			err := fs.AppendEntries(batch)
+			if !errors.Is(err, errInjected) {
+				t.Fatalf("AppendEntries with fault = %v, want the injected error", err)
+			}
+			if errors.Is(err, ErrFailed) {
+				t.Fatalf("AppendEntries = %v: the rollback succeeded, the store must stay usable", err)
+			}
+			// Memory and disk both still hold the acknowledged log only.
+			if s := mustLoad(t, fs); !reflect.DeepEqual(s.Entries, first) {
+				t.Fatalf("after failed append Load() = %+v, want %+v", s.Entries, first)
+			}
+			if n := logLines(t, dir); n != 2 {
+				t.Fatalf("log.jsonl has %d lines after the rollback, want 2", n)
+			}
+			ff.write, ff.sync = nil, nil
+			if err := fs.AppendEntries(batch); err != nil {
+				t.Fatalf("retry after rollback: %v", err)
+			}
+			fs2 := reopenAfterCrash(t, fs)
+			if s := mustLoad(t, fs2); !reflect.DeepEqual(s.Entries, want) {
+				t.Fatalf("after retry and reopen Load() = %+v, want %+v", s.Entries, want)
+			}
+		})
+	}
+}
+
+func TestFileStorageFailedRollbackFailsStore(t *testing.T) {
+	// The batch lands as complete lines, the fsync fails and so does the
+	// truncate that would have removed the lines again. The store cannot
+	// know what the file holds, so it must refuse every further call: a
+	// retry that appended on top would duplicate indexes and make the log
+	// unloadable. A restart reconciles from the file instead.
+	dir := t.TempDir()
+	fs := mustOpen(t, dir)
+	first := storagetest.Entries([2]uint64{1, 1}, [2]uint64{2, 1})
+	batch := storagetest.Entries([2]uint64{3, 2}, [2]uint64{4, 2})
+	if err := fs.AppendEntries(first); err != nil {
+		t.Fatal(err)
+	}
+	ff := injectFaults(fs)
+	ff.sync = func(*os.File) error { return errInjected }
+	ff.truncate = func(*os.File, int64) error { return errInjected }
+	err := fs.AppendEntries(batch)
+	if !errors.Is(err, ErrFailed) || !errors.Is(err, errInjected) {
+		t.Fatalf("AppendEntries = %v, want ErrFailed wrapping the injected error", err)
+	}
+
+	// The failure is sticky even after the disk "recovers".
+	ff.sync, ff.truncate = nil, nil
+	calls := map[string]func() error{
+		"AppendEntries":  func() error { return fs.AppendEntries(batch) },
+		"SaveTermVote":   func() error { return fs.SaveTermVote(3, "b") },
+		"TruncateSuffix": func() error { return fs.TruncateSuffix(1) },
+		"Load":           func() error { _, err := fs.Load(); return err },
+	}
+	for name, call := range calls {
+		if err := call(); !errors.Is(err, ErrFailed) {
+			t.Fatalf("%s on a failed store = %v, want ErrFailed", name, err)
+		}
+	}
+	if n := logLines(t, dir); n != 4 {
+		t.Fatalf("log.jsonl has %d lines, want the batch exactly once (4)", n)
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close on a failed store: %v", err)
+	}
+
+	// Reopen: the unacknowledged batch survived intact, which is the same
+	// outcome as a crash between write and fsync and is valid Raft state.
+	fs2 := mustOpen(t, dir)
+	defer fs2.Close()
+	want := append(append([]raft.LogEntry(nil), first...), batch...)
+	if s := mustLoad(t, fs2); !reflect.DeepEqual(s.Entries, want) {
+		t.Fatalf("after reopen Load() = %+v, want %+v", s.Entries, want)
+	}
+	if err := fs2.AppendEntries(storagetest.Entries([2]uint64{5, 2})); err != nil {
+		t.Fatalf("append after recovery: %v", err)
+	}
+}
+
+func TestFileStorageReplaceFailsStoreAfterRename(t *testing.T) {
+	// A directory sync that fails after the rename leaves the new file in
+	// place with unknown durability; for TruncateSuffix the append handle
+	// also still points at the old, now unlinked, file. Continuing would
+	// send later appends into a file that no longer exists on restart.
+	ops := map[string]func(fs *FileStorage) error{
+		"TruncateSuffix": func(fs *FileStorage) error { return fs.TruncateSuffix(2) },
+		"SaveTermVote":   func(fs *FileStorage) error { return fs.SaveTermVote(7, "c") },
+	}
+	for name, op := range ops {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			fs := mustOpen(t, dir)
+			three := storagetest.Entries([2]uint64{1, 1}, [2]uint64{2, 1}, [2]uint64{3, 1})
+			if err := fs.AppendEntries(three); err != nil {
+				t.Fatal(err)
+			}
+			restore := hookSyncDir(t)
+			err := op(fs)
+			restore()
+			if !errors.Is(err, ErrFailed) || !errors.Is(err, errInjected) {
+				t.Fatalf("%s with dir sync failing = %v, want ErrFailed wrapping the injected error", name, err)
+			}
+			if err := fs.AppendEntries(storagetest.Entries([2]uint64{4, 1})); !errors.Is(err, ErrFailed) {
+				t.Fatalf("AppendEntries after a failed replace = %v, want ErrFailed", err)
+			}
+			// Whatever the disk holds must load: here the rename did happen.
+			fs2 := reopenAfterCrash(t, fs)
+			s := mustLoad(t, fs2)
+			if name == "TruncateSuffix" && len(s.Entries) != 1 {
+				t.Fatalf("after reopen Entries = %+v, want the truncated log", s.Entries)
+			}
+			if name == "SaveTermVote" && (s.CurrentTerm != 7 || s.VotedFor != "c") {
+				t.Fatalf("after reopen term/vote = %d/%s, want 7/c", s.CurrentTerm, s.VotedFor)
+			}
+			if err := fs2.AppendEntries(storagetest.Entries([2]uint64{uint64(len(s.Entries)) + 1, 9})); err != nil {
+				t.Fatalf("append after recovery: %v", err)
+			}
+		})
+	}
+}

@@ -253,13 +253,13 @@ func (c *Cluster) Propose(cmd []byte) (raft.Index, error) {
 
 // LogsConverged reports whether every node holds exactly the Leader's
 // persisted log. It is false without a unique Leader and false while any
-// store is closed (a log nobody can read is not known to agree). It counts
-// every node, whatever the network looks like: a predicate that only
-// looked at the nodes the Leader can reach would be trivially true for a
-// fully isolated Leader, and RunUntil on it would stop before anything was
-// replicated. A partition test that wants "the majority agrees" should
-// compare the logs it means. Convergence is measured on Storage, so it says
-// nothing about a scripted core without one.
+// log cannot be read: a closed store, or a scripted core without a Storage
+// (a log nobody can observe is not known to agree). It counts every node,
+// whatever the network looks like: a predicate that only looked at the
+// nodes the Leader can reach would be trivially true for a fully isolated
+// Leader, and RunUntil on it would stop before anything was replicated. A
+// partition test that wants "the majority agrees" should compare the logs
+// it means.
 func (c *Cluster) LogsConverged() bool {
 	leader := c.Leader()
 	if leader == nil {

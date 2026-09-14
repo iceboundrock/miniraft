@@ -1,6 +1,7 @@
 package simulator
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -50,11 +51,15 @@ func (n *SimNode) ID() raft.NodeID { return n.id }
 // Status returns the core's observable state.
 func (n *SimNode) Status() raft.Status { return n.core.Status() }
 
-// Log returns the node's persisted log, read back from Storage, or nil for
-// a node without one (a scripted core). Tests compare what nodes have
-// actually written, not what a core claims. It panics when the store is
-// closed: a test that closed it and still asks is asking for something
-// that no longer exists.
+// errNoStorage is loadLog's answer for a node without a Storage: there is
+// no persisted log to observe, which is not the same as an empty one.
+var errNoStorage = errors.New("simulator: node has no Storage")
+
+// Log returns the node's persisted log, read back from Storage. Tests
+// compare what nodes have actually written, not what a core claims. It
+// panics when the node has no Storage (a scripted core) or the store is
+// closed: a test that asks for a log that cannot be read is asking for
+// something that does not exist.
 func (n *SimNode) Log() []raft.LogEntry {
 	log, err := n.loadLog()
 	if err != nil {
@@ -63,13 +68,15 @@ func (n *SimNode) Log() []raft.LogEntry {
 	return log
 }
 
-// loadLog is Log for the harness itself: a closed store is reported as
-// storage.ErrClosed instead of a panic, because the invariant checker and
-// LogsConverged run after every input and must keep going when a test
-// has closed a node's store to make its writes fail.
+// loadLog is Log for the harness itself: a missing or closed store is
+// reported as an error (errNoStorage, storage.ErrClosed) instead of a
+// panic, because the invariant checker and LogsConverged run after every
+// input and must keep going when a node has no store or a test has closed
+// one to make its writes fail. An error means "not observable", never
+// "empty".
 func (n *SimNode) loadLog() ([]raft.LogEntry, error) {
 	if n.Storage == nil {
-		return nil, nil
+		return nil, errNoStorage
 	}
 	st, err := n.Storage.Load()
 	if err != nil {

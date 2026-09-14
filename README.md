@@ -247,7 +247,8 @@ test that only cares about one side compares those logs itself.
 `SimNode.Log()` reads the log back from storage. A node whose
 `MemoryStorage` was closed by a test answers every write with
 `storage.ErrClosed`; the invariant checker skips its log until it is
-readable again, and `LogsConverged()` is false while it is closed.
+readable again, and `LogsConverged()` is false while it is closed, as it
+is for a scripted core that has no storage to observe.
 
 ### Persistence
 
@@ -262,9 +263,14 @@ keeps a node's persistent state in one directory of human-readable JSON:
 
 Guaranteed: a write is durable when `SaveTermVote`/`AppendEntries` returns;
 `state.json` is never half-written; a partial trailing line left by a crash
-mid-append is discarded on `Open` (that append was never acknowledged). Not
-guaranteed: per-entry checksums, torn-write protection finer than one line,
-log rotation or compaction, a lock against two processes on one directory.
+mid-append is discarded on `Open` (that append was never acknowledged); a
+failed `AppendEntries` truncates the file back to its previous length and
+fsyncs the cut, so the retry the core makes appends the batch exactly once.
+If that rollback fails, or an atomic replace fails after its rename, the
+store fails closed: every call returns `storage.ErrFailed` and the process
+must reopen the directory (a restart reconciles the file). Not guaranteed:
+per-entry checksums, torn-write protection finer than one line, log
+rotation or compaction, a lock against two processes on one directory.
 Corruption before the last line is an error from `Open`, never repaired.
 `MemoryStorage` and `FileStorage` pass the same conformance suite
 (`go test ./internal/storage/ -run TestStorageConformance -v`).

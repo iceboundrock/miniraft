@@ -283,6 +283,35 @@ func TestClusterLeaderAndRoles(t *testing.T) {
 	}
 }
 
+// TestLogsConvergedNeedsStorage: convergence is measured on Storage, so a
+// scripted core without one is never "converged". Without this the harness
+// would compare a nil log to a nil log and report equal empty logs for
+// nodes that were never observed.
+func TestLogsConvergedNeedsStorage(t *testing.T) {
+	c, err := NewCluster(Config{Seed: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fa, fb := &fakeCore{id: "a"}, &fakeCore{id: "b"}
+	c.AddNode("a", fa)
+	b := c.AddNode("b", fb)
+	fa.status = raft.Status{Role: raft.Leader, Term: 1}
+	if c.LogsConverged() {
+		t.Fatal("LogsConverged with a Leader that has no Storage")
+	}
+	// A Leader with a store is still not converged with a peer without one.
+	a := c.Node("a")
+	a.Storage = storage.NewMemoryStorage()
+	if c.LogsConverged() {
+		t.Fatal("LogsConverged with a follower that has no Storage")
+	}
+	b.Storage = storage.NewMemoryStorage()
+	if !c.LogsConverged() {
+		t.Fatal("LogsConverged is false with two empty stores")
+	}
+	assertPanics(t, "Log() without Storage", func() { c.AddNode("c", &fakeCore{id: "c"}).Log() })
+}
+
 // TestInvariantChecker: violations are detected after every core input,
 // logged to the timeline and reported by AssertInvariants. Clusters are
 // built with NewCluster directly because newTestCluster fails the test on

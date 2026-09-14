@@ -28,7 +28,10 @@ type Storage interface {
 	// AppendEntries durably appends entries, which must be a well-formed
 	// suffix starting at the current last index + 1 (see ValidateEntries:
 	// indexes >= 1, contiguous without wrapping, non-zero terms). The call is
-	// all-or-nothing: on error the stored log is unchanged.
+	// all-or-nothing: on error the stored log is unchanged, so the caller may
+	// retry the same suffix. An implementation that cannot restore the
+	// previous state after a failed write must refuse every further call
+	// (see storage.ErrFailed) rather than leave the log ambiguous.
 	AppendEntries(entries []LogEntry) error
 	// TruncateSuffix durably deletes every entry with Index >= fromIndex.
 	TruncateSuffix(fromIndex Index) error

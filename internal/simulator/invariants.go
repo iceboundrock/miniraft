@@ -70,11 +70,9 @@ func (c *Cluster) checkInvariants() {
 	for _, id := range c.ids {
 		n := c.nodes[id]
 		st := n.Status()
-		if n.Storage != nil {
-			if log, err := n.loadLog(); err == nil {
-				logs[id] = log
-				c.checkLogInvariants(id, st, log)
-			}
+		if log, err := n.loadLog(); err == nil {
+			logs[id] = log
+			c.checkLogInvariants(id, st, log)
 		}
 		if st.Role == raft.Leader {
 			if other, seen := c.inv.leaders[st.Term]; !seen {
