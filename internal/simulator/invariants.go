@@ -33,7 +33,11 @@ import (
 //     precondition for trusting the two above, which read Storage.
 //
 // The log invariants read each node's Storage and are skipped for nodes
-// without one (scripted cores).
+// without one (scripted cores) and for nodes whose store is closed: the
+// log is on "disk" but unreadable until the node restarts over the store
+// (issue #9), so there is nothing to compare this round. Skipping is safe
+// because a closed store also rejects every write, so the log it holds is
+// the one that was already checked.
 //
 // Violations are logged to the timeline and accumulated; they are never
 // repaired and never stop the simulation, so a test sees the full timeline
@@ -67,8 +71,10 @@ func (c *Cluster) checkInvariants() {
 		n := c.nodes[id]
 		st := n.Status()
 		if n.Storage != nil {
-			logs[id] = n.Log()
-			c.checkLogInvariants(id, st, logs[id])
+			if log, err := n.loadLog(); err == nil {
+				logs[id] = log
+				c.checkLogInvariants(id, st, log)
+			}
 		}
 		if st.Role == raft.Leader {
 			if other, seen := c.inv.leaders[st.Term]; !seen {

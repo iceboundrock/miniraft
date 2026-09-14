@@ -372,14 +372,102 @@ func TestLogsConverged(t *testing.T) {
 		t.Fatal("LogsConverged right after Propose, before any delivery")
 	}
 	c.RunFor(2 * DefaultLatency)
-	if !c.LogsConverged() {
-		t.Fatal("LogsConverged should ignore the isolated node")
+	if c.LogsConverged() {
+		t.Fatal("LogsConverged while the isolated node is still behind")
 	}
 	c.Network().Heal()
-	if c.LogsConverged() {
-		t.Fatal("LogsConverged with the healed node still behind")
-	}
 	requireConverged(t, c, time.Second)
+}
+
+// TestLogsConvergedIsolatedLeader: a Leader cut off from every follower is
+// not "converged", so RunUntil(LogsConverged) keeps running instead of
+// returning before anything was replicated. This is the reason the
+// predicate counts every node and not just the ones the Leader can reach.
+func TestLogsConvergedIsolatedLeader(t *testing.T) {
+	c := newTestCluster(t, Config{Seed: 1, NodeIDs: []raft.NodeID{"a", "b", "c"}})
+	leader := electLeader(t, c)
+	c.Network().Isolate(leader.ID())
+	proposeAll(t, c, "SET x 1")
+	if c.LogsConverged() {
+		t.Fatal("LogsConverged with the Leader isolated from every follower")
+	}
+	// Well inside the followers' election timeout, so the isolated node is
+	// still the only Leader and its entry has reached nobody.
+	if c.RunUntil(c.LogsConverged, DefaultHeartbeatInterval) {
+		t.Fatal("RunUntil(LogsConverged) returned while the Leader was isolated")
+	}
+	for _, n := range c.Nodes() {
+		if n != leader {
+			requireLogEquals(t, n)
+		}
+	}
+	c.Network().Heal()
+	requireConverged(t, c, time.Second)
+	requireLogEquals(t, leader, "SET x 1")
+}
+
+// TestProposeOnClosedStorage: a proposal the Leader cannot persist is
+// answered with the storage error. It is a client-facing answer, so it is
+// not in Errors(), and the invariant checker that runs after every input
+// must cope with the unreadable store rather than panic.
+func TestProposeOnClosedStorage(t *testing.T) {
+	c := newTestCluster(t, Config{Seed: 1, NodeIDs: []raft.NodeID{"a", "b", "c"}})
+	leader := electLeader(t, c)
+	if err := leader.Storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	idx, err := leader.Propose([]byte("SET x 1"))
+	if !errors.Is(err, storage.ErrClosed) || idx != 0 {
+		t.Fatalf("Propose = (%d, %v), want (0, %v)", idx, err, storage.ErrClosed)
+	}
+	requireNoErrors(t, c)
+	if err := c.AssertInvariants(); err != nil {
+		t.Fatal(err)
+	}
+	if c.LogsConverged() {
+		t.Fatal("LogsConverged with the Leader's store closed")
+	}
+}
+
+// TestClosedFollowerStorageIsRecorded: a follower whose store is closed
+// cannot append what the Leader sends; that is the core failing an input,
+// so it lands in Errors(), while the rest of the cluster keeps going and
+// the invariant checker skips the unreadable store.
+func TestClosedFollowerStorageIsRecorded(t *testing.T) {
+	c := newTestCluster(t, Config{Seed: 1, NodeIDs: []raft.NodeID{"a", "b", "c"}})
+	leader := electLeader(t, c)
+	var closed, open *SimNode
+	for _, n := range c.Nodes() {
+		if n == leader {
+			continue
+		}
+		if closed == nil {
+			closed = n
+		} else {
+			open = n
+		}
+	}
+	if err := closed.Storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	proposeAll(t, c, "SET x 1")
+	c.RunFor(2 * DefaultLatency)
+	requireLogEquals(t, open, "SET x 1")
+	errs := c.Errors()
+	if len(errs) == 0 || !errors.Is(errs[0], storage.ErrClosed) {
+		t.Fatalf("Errors() = %v, want the closed follower's %v", errs, storage.ErrClosed)
+	}
+	for _, err := range errs {
+		if !strings.HasPrefix(err.Error(), "node "+string(closed.ID())+":") {
+			t.Fatalf("error from a node other than %s: %v", closed.ID(), err)
+		}
+	}
+	if c.LogsConverged() {
+		t.Fatalf("LogsConverged with %s's store closed", closed.ID())
+	}
+	if err := c.AssertInvariants(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestLogInvariantChecker: Log Matching and Leader Append-Only are checked

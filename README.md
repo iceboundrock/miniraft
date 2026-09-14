@@ -240,9 +240,14 @@ returns as soon as the entry is in the Leader's own log.
 In the simulator, `Cluster.Propose(cmd)` routes to `Leader()` (an error
 when there is none), `SimNode.Propose(cmd)` targets one node — both return
 the client's answer rather than recording it in `Errors()` — and
-`Cluster.LogsConverged()` is the usual `RunUntil` predicate: every node that
-can currently exchange messages with the Leader holds exactly the Leader's
-persisted log. `SimNode.Log()` reads the log back from storage.
+`Cluster.LogsConverged()` is the usual `RunUntil` predicate: every node holds
+exactly the Leader's persisted log. It counts every node regardless of the
+network, so it never reports an isolated Leader as converged; a partition
+test that only cares about one side compares those logs itself.
+`SimNode.Log()` reads the log back from storage. A node whose
+`MemoryStorage` was closed by a test answers every write with
+`storage.ErrClosed`; the invariant checker skips its log until it is
+readable again, and `LogsConverged()` is false while it is closed.
 
 ### Persistence
 

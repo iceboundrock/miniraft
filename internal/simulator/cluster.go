@@ -251,25 +251,31 @@ func (c *Cluster) Propose(cmd []byte) (raft.Index, error) {
 	return leader.Propose(cmd)
 }
 
-// LogsConverged reports whether every node that can currently exchange
-// messages with the Leader (both directions connected) holds exactly the
-// Leader's persisted log. It is false without a unique Leader. Nodes cut
-// off from the Leader are ignored: they cannot converge until the network
-// heals, and a test that isolates one usually wants to run "until the rest
-// agree". Convergence is measured on Storage, so it says nothing about a
-// scripted core without one.
+// LogsConverged reports whether every node holds exactly the Leader's
+// persisted log. It is false without a unique Leader and false while any
+// store is closed (a log nobody can read is not known to agree). It counts
+// every node, whatever the network looks like: a predicate that only
+// looked at the nodes the Leader can reach would be trivially true for a
+// fully isolated Leader, and RunUntil on it would stop before anything was
+// replicated. A partition test that wants "the majority agrees" should
+// compare the logs it means. Convergence is measured on Storage, so it says
+// nothing about a scripted core without one.
 func (c *Cluster) LogsConverged() bool {
 	leader := c.Leader()
 	if leader == nil {
 		return false
 	}
-	want := leader.Log()
+	want, err := leader.loadLog()
+	if err != nil {
+		return false
+	}
 	for _, id := range c.ids {
 		n := c.nodes[id]
-		if n == leader || !c.network.Connected(leader.id, id) || !c.network.Connected(id, leader.id) {
+		if n == leader {
 			continue
 		}
-		if !slices.EqualFunc(n.Log(), want, sameEntry) {
+		log, err := n.loadLog()
+		if err != nil || !slices.EqualFunc(log, want, sameEntry) {
 			return false
 		}
 	}

@@ -51,17 +51,31 @@ func (n *SimNode) ID() raft.NodeID { return n.id }
 func (n *SimNode) Status() raft.Status { return n.core.Status() }
 
 // Log returns the node's persisted log, read back from Storage, or nil for
-// a node without one (a scripted core). Tests and the invariant checker
-// compare what nodes have actually written, not what a core claims.
+// a node without one (a scripted core). Tests compare what nodes have
+// actually written, not what a core claims. It panics when the store is
+// closed: a test that closed it and still asks is asking for something
+// that no longer exists.
 func (n *SimNode) Log() []raft.LogEntry {
-	if n.Storage == nil {
-		return nil
-	}
-	st, err := n.Storage.Load()
+	log, err := n.loadLog()
 	if err != nil {
 		panic(fmt.Sprintf("simulator: node %s: load storage: %v", n.id, err))
 	}
-	return st.Entries
+	return log
+}
+
+// loadLog is Log for the harness itself: a closed store is reported as
+// storage.ErrClosed instead of a panic, because the invariant checker and
+// LogsConverged run after every input and must keep going when a test
+// has closed a node's store to make its writes fail.
+func (n *SimNode) loadLog() ([]raft.LogEntry, error) {
+	if n.Storage == nil {
+		return nil, nil
+	}
+	st, err := n.Storage.Load()
+	if err != nil {
+		return nil, err
+	}
+	return st.Entries, nil
 }
 
 // ElectionTimerArmed reports whether an election timer is pending.
