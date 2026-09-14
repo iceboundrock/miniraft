@@ -352,7 +352,7 @@ func TestFigure7Scenarios(t *testing.T) {
 
 // TestLogsConverged: false without a Leader, false while a connected
 // follower's log differs, and it ignores a node the Leader cannot reach:
-// once the connected majority agrees it is true even though the isolated
+// once every connected node agrees it is true even though the isolated
 // node is behind, and it drops back to false the moment that node is
 // reconnected and counted again.
 func TestLogsConverged(t *testing.T) {
@@ -377,7 +377,7 @@ func TestLogsConverged(t *testing.T) {
 	}
 	c.RunFor(2 * DefaultLatency)
 	if !c.LogsConverged() {
-		t.Fatal("LogsConverged is false although the connected majority holds the entry")
+		t.Fatal("LogsConverged is false although every connected node holds the entry")
 	}
 	requireLogEquals(t, other)
 	c.Network().Heal()
@@ -389,8 +389,8 @@ func TestLogsConverged(t *testing.T) {
 }
 
 // TestLogsConvergedIgnoresIsolatedDivergentNode: the partition-side use of
-// the predicate from issue #7. The Leader's side of the partition is a
-// majority whose logs agree, so RunUntil(LogsConverged) returns while the
+// the predicate from issue #7. Every node on the Leader's side of the
+// partition agrees with it, so RunUntil(LogsConverged) returns while the
 // isolated node still holds its divergent suffix (Figure 7 (f)); the node
 // is repaired only after the network heals.
 func TestLogsConvergedIgnoresIsolatedDivergentNode(t *testing.T) {
@@ -419,7 +419,7 @@ func TestLogsConvergedIgnoresIsolatedDivergentNode(t *testing.T) {
 	}
 	proposeAll(t, c, "SET x 1")
 	if !c.RunUntil(c.LogsConverged, time.Second) {
-		t.Fatal("the connected majority did not converge")
+		t.Fatal("the Leader's side of the partition did not converge")
 	}
 	if got := terms(c.Node("b").Log()); fmt.Sprint(got) != fmt.Sprint(divergent) {
 		t.Fatalf("isolated b log terms = %v, want its divergent log %v untouched", got, divergent)
@@ -446,8 +446,8 @@ func TestLogsConvergedIgnoresIsolatedDivergentNode(t *testing.T) {
 // TestLogsConvergedIsolatedLeader: a Leader cut off from every follower is
 // not "converged", so RunUntil(LogsConverged) keeps running instead of
 // returning before anything was replicated. Ignoring unreachable nodes
-// alone would make this vacuously true; the majority requirement is what
-// prevents it.
+// alone would make this vacuously true (nothing compared, nothing
+// differs); the predicate needs at least one follower it can observe.
 func TestLogsConvergedIsolatedLeader(t *testing.T) {
 	c := newTestCluster(t, Config{Seed: 1, NodeIDs: []raft.NodeID{"a", "b", "c"}})
 	leader := electLeader(t, c)
@@ -457,8 +457,9 @@ func TestLogsConvergedIsolatedLeader(t *testing.T) {
 		t.Fatal("LogsConverged with the Leader isolated from every follower")
 	}
 	// Well inside the followers' election timeout, so the isolated node is
-	// still the only Leader and its entry has reached nobody.
-	if c.RunUntil(c.LogsConverged, DefaultHeartbeatInterval) {
+	// still the only Leader and its entry has reached nobody. RunUntil takes
+	// an absolute deadline.
+	if c.RunUntil(c.LogsConverged, c.Now()+DefaultHeartbeatInterval) {
 		t.Fatal("RunUntil(LogsConverged) returned while the Leader was isolated")
 	}
 	for _, n := range c.Nodes() {
@@ -471,10 +472,14 @@ func TestLogsConvergedIsolatedLeader(t *testing.T) {
 	requireLogEquals(t, leader, "SET x 1")
 }
 
-// TestLogsConvergedNeedsMajority: a Leader that reaches some followers but
-// not a quorum is not converged either, even when every node it reaches
-// agrees with it. Five nodes, the Leader and one follower on one side.
-func TestLogsConvergedNeedsMajority(t *testing.T) {
+// TestLogsConvergedMinorityComponent: the predicate is about replication,
+// not commit, so a Leader's side of a partition need not be a quorum. Five
+// nodes, the Leader and one follower cut off from the other three: once
+// that follower holds the Leader's log, every connected node agrees and
+// LogsConverged is true even though the pair can never commit. The three
+// others are still empty, and reconnecting them makes it false again until
+// they catch up.
+func TestLogsConvergedMinorityComponent(t *testing.T) {
 	c := newTestCluster(t, Config{Seed: 1, NodeIDs: []raft.NodeID{"a", "b", "c", "d", "e"}})
 	leader := electLeader(t, c)
 	var minority, majority []raft.NodeID
@@ -487,26 +492,49 @@ func TestLogsConvergedNeedsMajority(t *testing.T) {
 	}
 	c.Network().Partition([][]raft.NodeID{minority, majority})
 	proposeAll(t, c, "SET x 1")
-	c.RunFor(2 * DefaultLatency)
-	for _, id := range minority {
-		requireLogEquals(t, c.Node(id), "SET x 1")
-	}
 	if c.LogsConverged() {
-		t.Fatal("LogsConverged with the Leader reaching only a minority")
+		t.Fatal("LogsConverged right after Propose, before any delivery")
 	}
 	// Inside the majority side's election timeout: the partitioned Leader
-	// is still the only Leader and must not be reported as converged.
-	if c.RunUntil(c.LogsConverged, DefaultHeartbeatInterval) {
-		t.Fatal("RunUntil(LogsConverged) returned while the Leader reached only a minority")
+	// is still the only Leader, and its one reachable follower is enough.
+	// RunUntil takes an absolute deadline.
+	if !c.RunUntil(c.LogsConverged, c.Now()+DefaultHeartbeatInterval) {
+		t.Fatal("RunUntil(LogsConverged) did not return although every connected node held the entry")
+	}
+	for _, id := range minority {
+		requireLogEquals(t, c.Node(id), "SET x 1")
 	}
 	for _, id := range majority {
 		requireLogEquals(t, c.Node(id))
 	}
 	c.Network().Heal()
+	if c.LogsConverged() {
+		t.Fatal("LogsConverged right after Heal, while the reconnected nodes are still behind")
+	}
 	requireConverged(t, c, time.Second)
 	for _, n := range c.Nodes() {
 		requireLogEquals(t, n, "SET x 1")
 	}
+}
+
+// TestLogsConvergedSingleNode: a one-node cluster has no follower to
+// observe, and that is not the isolated-Leader case: with no peers at all
+// the Leader's log is the whole cluster's log, so the predicate is true as
+// soon as there is a Leader and stays true across a proposal.
+func TestLogsConvergedSingleNode(t *testing.T) {
+	c := newTestCluster(t, Config{Seed: 1, NodeIDs: []raft.NodeID{"a"}})
+	if c.LogsConverged() {
+		t.Fatal("LogsConverged with no Leader")
+	}
+	if !c.RunUntil(c.LogsConverged, time.Second) {
+		t.Fatal("a single node did not converge within 1s")
+	}
+	proposeAll(t, c, "SET x 1")
+	if !c.LogsConverged() {
+		t.Fatal("LogsConverged is false on a single node after Propose")
+	}
+	requireLogEquals(t, c.Node("a"), "SET x 1")
+	requireNoErrors(t, c)
 }
 
 // TestProposeOnClosedStorage: a proposal the Leader cannot persist is

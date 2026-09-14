@@ -252,16 +252,19 @@ func (c *Cluster) Propose(cmd []byte) (raft.Index, error) {
 }
 
 // LogsConverged reports whether every node connected to the Leader holds
-// exactly the Leader's persisted log, and those nodes form a majority of
-// the cluster. "Connected" is the set replication can actually reach:
-// nodes whose link to the Leader is open in both directions. Nodes cut
-// off from the Leader are ignored, so a partition test can run "until the
-// majority side agrees" while a divergent isolated node is left behind
-// (it converges once the network heals). The majority requirement is what
-// keeps that from becoming vacuous: a Leader that cannot reach a quorum
-// can make no progress, so its side agreeing with itself is not
-// convergence, and without the rule RunUntil on a fully isolated Leader
-// would return before anything was replicated.
+// exactly the Leader's persisted log. "Connected" is the set replication
+// can actually reach: nodes whose link to the Leader is open in both
+// directions. Nodes cut off from the Leader are ignored, so a partition
+// test can run "until the Leader's side agrees" while a divergent isolated
+// node is left behind (it converges once the network heals). The Leader's
+// side need not be a quorum: this predicate is about replication, which
+// reaches whatever the network lets it reach, not about commit.
+//
+// Convergence is observed, not assumed: a Leader that has peers but can
+// reach none of them reads false rather than vacuously true, so RunUntil
+// keeps running instead of returning before anything was replicated. A
+// single-node cluster has no follower to observe and is converged as soon
+// as it has a Leader.
 //
 // It is false without a unique Leader and false while a compared log
 // cannot be read: a closed store, or a scripted core without a Storage (a
@@ -275,20 +278,19 @@ func (c *Cluster) LogsConverged() bool {
 	if err != nil {
 		return false
 	}
-	connected := 1 // the Leader itself
+	followers := 0
 	for _, id := range c.ids {
 		n := c.nodes[id]
 		if n == leader || !c.network.Connected(leader.id, id) || !c.network.Connected(id, leader.id) {
 			continue
 		}
-		connected++
+		followers++
 		log, err := n.loadLog()
 		if err != nil || !slices.EqualFunc(log, want, sameEntry) {
 			return false
 		}
 	}
-	// Same arithmetic as the core's quorum: a strict majority of all nodes.
-	return connected >= len(c.ids)/2+1
+	return followers > 0 || len(c.ids) == 1
 }
 
 // sameEntry reports whether two entries are identical, command included.
