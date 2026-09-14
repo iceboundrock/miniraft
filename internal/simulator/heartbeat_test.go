@@ -2,6 +2,7 @@ package simulator
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -45,6 +46,22 @@ func TestRunFor(t *testing.T) {
 	// first timeout, which lies in [150ms, 300ms].
 	if c.Node("a").Status().Role != raft.Leader {
 		t.Fatal("RunFor did not execute the election timeout inside its window")
+	}
+}
+
+// TestRunForRejectsOverflow: RunFor must follow the clock's overflow policy
+// (panic, never wrap). An empty cluster has no timers, so it can be advanced
+// to the end of logical time without firing anything.
+func TestRunForRejectsOverflow(t *testing.T) {
+	c := newTestCluster(t, Config{Seed: 1})
+	end := time.Duration(math.MaxInt64)
+	c.RunFor(end)
+	if now := c.Now(); now != end {
+		t.Fatalf("Now = %v after RunFor(MaxInt64), want %v", now, end)
+	}
+	assertPanics(t, "RunFor(1ns) at end of time", func() { c.RunFor(time.Nanosecond) })
+	if now := c.Now(); now != end {
+		t.Fatalf("Now = %v after rejected RunFor, want %v (clock untouched)", now, end)
 	}
 }
 

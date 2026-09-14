@@ -255,12 +255,16 @@ func (c *Cluster) Run(until time.Duration) {
 }
 
 // RunFor executes every event in the next d of simulated time, then sets
-// the clock to Now()+d.
+// the clock to Now()+d. It panics on a negative d or when Now()+d would pass
+// the end of logical time (the clock's overflow policy: never wrap, because
+// a wrapped target would be "in the past" and silently do nothing).
 func (c *Cluster) RunFor(d time.Duration) {
 	if d < 0 {
 		panic(fmt.Sprintf("simulator: RunFor(%v) with a negative duration", d))
 	}
-	c.Run(c.clock.Now() + d)
+	// Advance checks the overflow itself; computing Now()+d here would wrap
+	// before Run could see it.
+	c.clock.Advance(d)
 }
 
 // StopHeartbeats silences node id as a Leader: every AppendEntries it sends
