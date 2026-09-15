@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"errors"
 	"testing"
 	"time"
 )
@@ -83,12 +82,9 @@ func TestNewNodeRejectsNilDependencies(t *testing.T) {
 	}
 }
 
-func TestProtocolEntryPointsNotImplemented(t *testing.T) {
+func TestStepRejectsMalformedMessageFirst(t *testing.T) {
 	n := newTestNode(t, testConfig("a", "b"), &memStorage{})
-	if _, err := n.Propose([]byte("x")); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("Propose: %v", err)
-	}
-	if _, err := n.Step(Message{Type: MsgRequestVote}); err == nil || errors.Is(err, ErrNotImplemented) {
+	if _, err := n.Step(Message{Type: MsgRequestVote}); err == nil {
 		t.Errorf("Step must reject a malformed message before anything else, got %v", err)
 	}
 }

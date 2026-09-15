@@ -120,6 +120,9 @@ func (n *Node) becomeLeader() []Action {
 		n.nextIndex[p] = next
 		n.matchIndex[p] = 0
 	}
+	// The Leader's own log trivially matches itself; keeping matchIndex[self]
+	// current lets the commit rule count the Leader like any other replica.
+	n.matchIndex[n.id] = n.log.lastIndex()
 	n.logger.Info("BecameLeader", "term", n.currentTerm, "role", n.role)
 	return []Action{StopElectionTimer{}, ResetHeartbeatTimer{Interval: n.cfg.HeartbeatInterval}}
 }

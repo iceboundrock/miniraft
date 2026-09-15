@@ -32,6 +32,10 @@ type memStorage struct {
 	// failSaveAfter more calls have succeeded (0 = fail the next call).
 	failSave      error
 	failSaveAfter int
+	// failAppend and failTruncate, when set, make AppendEntries and
+	// TruncateSuffix fail without writing.
+	failAppend   error
+	failTruncate error
 }
 
 func (m *memStorage) Load() (PersistentState, error) {
@@ -52,6 +56,9 @@ func (m *memStorage) SaveTermVote(term Term, votedFor NodeID) error {
 }
 
 func (m *memStorage) AppendEntries(entries []LogEntry) error {
+	if m.failAppend != nil {
+		return m.failAppend
+	}
 	if err := ValidateEntries(entries, Index(len(m.state.Entries)+1)); err != nil {
 		return fmt.Errorf("memStorage: append: %w", err)
 	}
@@ -60,6 +67,9 @@ func (m *memStorage) AppendEntries(entries []LogEntry) error {
 }
 
 func (m *memStorage) TruncateSuffix(from Index) error {
+	if m.failTruncate != nil {
+		return m.failTruncate
+	}
 	if from == 0 {
 		m.state.Entries = nil
 	} else if from <= Index(len(m.state.Entries)) {

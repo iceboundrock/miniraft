@@ -29,7 +29,8 @@ func countTimeline(c *Cluster, substr string) int {
 // electLeader runs c until an agreed Leader exists and returns it.
 func electLeader(t *testing.T, c *Cluster) *SimNode {
 	t.Helper()
-	if !c.RunUntil(electionAgreed(c), 2*time.Second) {
+	// RunUntil takes an absolute deadline; anchor the 2s window at now.
+	if !c.RunUntil(electionAgreed(c), c.Now()+2*time.Second) {
 		t.Fatalf("no agreed Leader within 2s: roles=%v", c.Roles())
 	}
 	return c.Leader()
@@ -88,8 +89,8 @@ func TestStableLeaderNoReelection(t *testing.T) {
 				}
 			}
 			if !timelineHas(c, "event=Heartbeat node="+string(leader.ID())) ||
-				!timelineHas(c, "event=HeartbeatAck node="+string(leader.ID())) {
-				t.Fatal("timeline missing Heartbeat / HeartbeatAck events")
+				!timelineHas(c, "event=AppendEntriesAck node="+string(leader.ID())) {
+				t.Fatal("timeline missing Heartbeat / AppendEntriesAck events")
 			}
 			requireNoErrors(t, c)
 		})
@@ -159,8 +160,9 @@ func TestOldLeaderStepsDownOnHigherTerm(t *testing.T) {
 }
 
 // TestHeartbeatConsistencyCheckFails: node a is elected with a log the
-// others lack, so its heartbeats (prevLogIndex = 2) are rejected by both
-// followers with Success=false, while they still recognize a as Leader.
+// others lack, so its first heartbeats (prevLogIndex = 2) are rejected by
+// both followers with Success=false, while they still recognize a as
+// Leader. The repair that follows is covered in replication_test.go.
 func TestHeartbeatConsistencyCheckFails(t *testing.T) {
 	c := newTestCluster(t, Config{Seed: 1, NodeIDs: []raft.NodeID{"a", "b", "c"},
 		Stores: map[raft.NodeID]*storage.MemoryStorage{
@@ -173,7 +175,7 @@ func TestHeartbeatConsistencyCheckFails(t *testing.T) {
 	c.RunFor(DefaultHeartbeatInterval + 3*DefaultLatency) // one heartbeat round trip
 
 	for _, id := range []raft.NodeID{"b", "c"} {
-		if !timelineHas(c, "event=HeartbeatAck node=a term=2 role=Leader peer="+string(id)+" success=false") {
+		if !timelineHas(c, "event=AppendEntriesAck node=a term=2 role=Leader peer="+string(id)+" success=false") {
 			t.Fatalf("timeline missing the failed ack from %s", id)
 		}
 		if st := c.Node(id).Status(); st.LeaderID != "a" || st.Role != raft.Follower {

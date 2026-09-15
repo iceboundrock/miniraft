@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -18,6 +19,17 @@ const (
 	logFileName   = "log.jsonl"  // one JSON-encoded raft.LogEntry per line
 	tmpSuffix     = ".tmp"       // staging file for an atomic replace
 )
+
+// ErrFailed is wrapped by every error a FileStorage returns once it has lost
+// track of what its files hold: a write failed and the rollback that would
+// have restored the previous state failed too, or an atomic replace failed
+// after the rename. Such a store refuses every further call so that nothing
+// is written on top of bytes whose fate is unknown; the process must exit
+// and a new Open reconciles the directory. The in-memory copy of a failed
+// store still describes the last acknowledged state but the disk may hold an
+// unacknowledged write (in full or as a prefix), which is the same situation
+// as a crash between write and fsync and is handled by the load rules.
+var ErrFailed = errors.New("storage: failed, reopen required")
 
 // FileStorage is the durable raft.Storage used by a real process. All state
 // lives in one directory as human-readable JSON (see the package doc for the
@@ -35,12 +47,23 @@ const (
 type FileStorage struct {
 	mu       sync.Mutex
 	dir      string
-	logFile  *os.File // O_APPEND handle on log.jsonl; nil once closed
-	logSize  int64    // bytes of log.jsonl that hold committed-to-disk lines
+	logFile  logFile // O_APPEND handle on log.jsonl; nil once closed
+	logSize  int64   // bytes of log.jsonl that hold acknowledged, fsynced lines
 	term     raft.Term
 	votedFor raft.NodeID
 	entries  []raft.LogEntry
 	closed   bool
+	failed   error // non-nil once the disk state is unknown; see ErrFailed
+}
+
+// logFile is the part of *os.File the log append path uses. It is an
+// interface only so that tests can inject write, sync and truncate failures,
+// which a real filesystem does not produce on request.
+type logFile interface {
+	io.Writer
+	Sync() error
+	Truncate(size int64) error
+	Close() error
 }
 
 // stateFile is the JSON shape of state.json.
@@ -159,13 +182,29 @@ func loadLog(path string) ([]raft.LogEntry, int64, error) {
 	return entries, int64(valid), nil
 }
 
+// usable is the guard at the top of every operation: ErrClosed after Close,
+// the sticky failure after fail, nil otherwise. Callers hold f.mu.
+func (f *FileStorage) usable() error {
+	if f.closed {
+		return ErrClosed
+	}
+	return f.failed
+}
+
+// fail records that the on-disk state is unknown, marks the store unusable
+// and returns the error every later call will also return. Callers hold f.mu.
+func (f *FileStorage) fail(cause error) error {
+	f.failed = fmt.Errorf("%w: %w", ErrFailed, cause)
+	return f.failed
+}
+
 // Load implements raft.Storage. It never touches the disk: Open already
 // loaded everything, and every mutation keeps the in-memory copy current.
 func (f *FileStorage) Load() (raft.PersistentState, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.closed {
-		return raft.PersistentState{}, ErrClosed
+	if err := f.usable(); err != nil {
+		return raft.PersistentState{}, err
 	}
 	return raft.PersistentState{
 		CurrentTerm: f.term,
@@ -178,8 +217,8 @@ func (f *FileStorage) Load() (raft.PersistentState, error) {
 func (f *FileStorage) SaveTermVote(term raft.Term, votedFor raft.NodeID) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.closed {
-		return ErrClosed
+	if err := f.usable(); err != nil {
+		return err
 	}
 	data, err := json.Marshal(stateFile{CurrentTerm: term, VotedFor: votedFor})
 	if err != nil {
@@ -187,7 +226,7 @@ func (f *FileStorage) SaveTermVote(term raft.Term, votedFor raft.NodeID) error {
 	}
 	tmp, err := replaceFile(f.dir, stateFileName, append(data, '\n'))
 	if err != nil {
-		return err
+		return f.replaceFailed(err)
 	}
 	// The new state is durable once replaceFile returns, so the in-memory copy
 	// follows the disk unconditionally; closing the handle is cleanup and
@@ -199,12 +238,14 @@ func (f *FileStorage) SaveTermVote(term raft.Term, votedFor raft.NodeID) error {
 
 // AppendEntries implements raft.Storage. The whole batch is encoded first and
 // written with a single Write followed by Sync, so on success every line is
-// durable and on failure the in-memory log is unchanged.
+// durable. On failure the in-memory log is unchanged and the file is rolled
+// back to its previous length (see rollbackTail), so the core's retry of the
+// same suffix appends exactly one copy of it.
 func (f *FileStorage) AppendEntries(entries []raft.LogEntry) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.closed {
-		return ErrClosed
+	if err := f.usable(); err != nil {
+		return err
 	}
 	if err := raft.ValidateEntries(entries, raft.Index(len(f.entries)+1)); err != nil {
 		return fmt.Errorf("storage: append: %w", err)
@@ -217,26 +258,53 @@ func (f *FileStorage) AppendEntries(entries []raft.LogEntry) error {
 		return err
 	}
 	if _, err := f.logFile.Write(data); err != nil {
-		// A short write leaves a partial tail that a later Open would discard;
-		// trim it now so this handle can keep appending on a line boundary.
-		f.rollbackTail()
-		return fmt.Errorf("storage: append %s: %w", logFileName, err)
+		return f.rollbackTail(fmt.Errorf("storage: append %s: %w", logFileName, err))
 	}
 	if err := f.logFile.Sync(); err != nil {
-		f.rollbackTail()
-		return fmt.Errorf("storage: sync %s: %w", logFileName, err)
+		return f.rollbackTail(fmt.Errorf("storage: sync %s: %w", logFileName, err))
 	}
 	f.logSize += int64(len(data))
 	f.entries = append(f.entries, raft.CloneEntries(entries)...)
 	return nil
 }
 
-// rollbackTail is best-effort recovery after a failed append: it truncates the
-// file back to the last durable line. Its own error is deliberately ignored;
-// the append already failed and the load-time partial-tail rule covers the
-// on-disk state either way.
-func (f *FileStorage) rollbackTail() {
-	_ = f.logFile.Truncate(f.logSize)
+// rollbackTail restores log.jsonl to its acknowledged length after an append
+// failed with cause, and returns the error the caller should report.
+//
+// A failed Write or Sync may have left nothing, a partial line, or every
+// line of the batch in the file (a failed fsync says nothing about which
+// bytes reached the disk). Truncating to logSize removes all of it and the
+// Sync makes the cut durable, so afterwards the file holds exactly the
+// acknowledged log and the next append (typically the core retrying the same
+// batch) starts on a clean line boundary. logSize itself was made durable by
+// the Sync of the append that produced it, so this Sync only has to persist
+// the shorter length.
+//
+// If the truncate or its Sync fails the file's content is unknown and the
+// store fails (ErrFailed): were it to stay usable, the retry would append a
+// second copy of the batch after a surviving first one, and ValidateEntries
+// would reject the log on the next Open. Refusing every further write keeps
+// the file loadable; a restart reconciles it.
+func (f *FileStorage) rollbackTail(cause error) error {
+	if err := f.logFile.Truncate(f.logSize); err != nil {
+		return f.fail(fmt.Errorf("%w; rollback truncate: %w", cause, err))
+	}
+	if err := f.logFile.Sync(); err != nil {
+		return f.fail(fmt.Errorf("%w; rollback sync: %w", cause, err))
+	}
+	return cause
+}
+
+// replaceFailed turns a replaceFile error into the error to report. A
+// failure before the rename left the old file intact and the store usable;
+// a failure after it (errAfterRename) means the new file is in place but not
+// known to be durable and, for log.jsonl, that the append handle still
+// points at the old, unlinked file, so the store fails.
+func (f *FileStorage) replaceFailed(err error) error {
+	if errors.Is(err, errAfterRename) {
+		return f.fail(err)
+	}
+	return err
 }
 
 // TruncateSuffix implements raft.Storage. The retained prefix is rewritten to
@@ -245,8 +313,8 @@ func (f *FileStorage) rollbackTail() {
 func (f *FileStorage) TruncateSuffix(from raft.Index) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.closed {
-		return ErrClosed
+	if err := f.usable(); err != nil {
+		return err
 	}
 	if from > raft.Index(len(f.entries)) {
 		return nil // nothing to delete
@@ -261,7 +329,7 @@ func (f *FileStorage) TruncateSuffix(from raft.Index) error {
 	}
 	newFile, err := replaceFile(f.dir, logFileName, data)
 	if err != nil {
-		return err
+		return f.replaceFailed(err)
 	}
 	// The new handle was opened with O_APPEND on the file that is now
 	// log.jsonl. The old handle points at the unlinked previous file: nothing
@@ -275,7 +343,8 @@ func (f *FileStorage) TruncateSuffix(from raft.Index) error {
 	return nil
 }
 
-// Close implements raft.Storage. It is idempotent.
+// Close implements raft.Storage. It is idempotent and also closes a failed
+// store.
 func (f *FileStorage) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -320,9 +389,11 @@ func encodeLog(entries []raft.LogEntry) ([]byte, error) {
 // happened and is durable, and nothing the caller does afterwards (closing the
 // returned handle, releasing an older one) can undo it. Callers therefore
 // update their in-memory state as soon as replaceFile returns and treat handle
-// cleanup as best-effort, so that nil always means "durable" and on error the
-// in-memory copy still describes the last acknowledged state (the disk may
-// then hold either version; neither was acknowledged to the core as new).
+// cleanup as best-effort, so that nil always means "durable". An error from
+// steps 1-3 leaves the old file intact under its name. An error from step 4
+// wraps errAfterRename: the new file is already under the name, its
+// durability is unknown, and the caller must not carry on as if the old one
+// were still there.
 func replaceFile(dir, name string, data []byte) (*os.File, error) {
 	path := filepath.Join(dir, name)
 	tmpPath := path + tmpSuffix
@@ -344,10 +415,13 @@ func replaceFile(dir, name string, data []byte) (*os.File, error) {
 	}
 	if err := syncDir(dir); err != nil {
 		tmp.Close()
-		return nil, err
+		return nil, fmt.Errorf("%w: %s: %w", errAfterRename, name, err)
 	}
 	return tmp, nil
 }
+
+// errAfterRename marks a replaceFile failure in the step after the rename.
+var errAfterRename = errors.New("storage: replace failed after rename")
 
 // truncateAndSync cuts path to size and makes the cut durable.
 func truncateAndSync(path string, size int64) error {
@@ -366,8 +440,9 @@ func truncateAndSync(path string, size int64) error {
 }
 
 // syncDir fsyncs a directory so that renames and file creations inside it are
-// durable.
-func syncDir(dir string) error {
+// durable. It is a variable so that a test can make it fail: it is the one
+// step of replaceFile that runs after the rename.
+var syncDir = func(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return fmt.Errorf("storage: open dir: %w", err)

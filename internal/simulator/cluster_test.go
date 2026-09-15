@@ -49,9 +49,9 @@ func (f *fakeCore) HeartbeatTimeout() ([]raft.Action, error) {
 	return nil, f.err
 }
 
-func (f *fakeCore) Propose(cmd []byte) ([]raft.Action, error) {
+func (f *fakeCore) Propose(cmd []byte) (raft.Index, []raft.Action, error) {
 	f.proposals = append(f.proposals, cmd)
-	return nil, f.err
+	return raft.Index(len(f.proposals)), nil, f.err
 }
 
 func (f *fakeCore) Start() []raft.Action {
@@ -134,7 +134,9 @@ func TestClusterTranslatesActions(t *testing.T) {
 	if !timelineHas(c, "event=Applied node=a index=3 term=2") {
 		t.Fatal("timeline missing Applied event")
 	}
-	a.Propose([]byte("SET x 1"))
+	if idx, err := a.Propose([]byte("SET x 1")); idx != 1 || err != nil {
+		t.Fatalf("Propose = (%d, %v), want (1, nil)", idx, err)
+	}
 	if len(fa.proposals) != 1 || string(fa.proposals[0]) != "SET x 1" {
 		t.Fatalf("proposals = %q", fa.proposals)
 	}
@@ -279,6 +281,35 @@ func TestClusterLeaderAndRoles(t *testing.T) {
 	if c.Leader() != nil {
 		t.Fatal("Leader() with two Leaders in the highest term must be nil")
 	}
+}
+
+// TestLogsConvergedNeedsStorage: convergence is measured on Storage, so a
+// scripted core without one is never "converged". Without this the harness
+// would compare a nil log to a nil log and report equal empty logs for
+// nodes that were never observed.
+func TestLogsConvergedNeedsStorage(t *testing.T) {
+	c, err := NewCluster(Config{Seed: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fa, fb := &fakeCore{id: "a"}, &fakeCore{id: "b"}
+	c.AddNode("a", fa)
+	b := c.AddNode("b", fb)
+	fa.status = raft.Status{Role: raft.Leader, Term: 1}
+	if c.LogsConverged() {
+		t.Fatal("LogsConverged with a Leader that has no Storage")
+	}
+	// A Leader with a store is still not converged with a peer without one.
+	a := c.Node("a")
+	a.Storage = storage.NewMemoryStorage()
+	if c.LogsConverged() {
+		t.Fatal("LogsConverged with a follower that has no Storage")
+	}
+	b.Storage = storage.NewMemoryStorage()
+	if !c.LogsConverged() {
+		t.Fatal("LogsConverged is false with two empty stores")
+	}
+	assertPanics(t, "Log() without Storage", func() { c.AddNode("c", &fakeCore{id: "c"}).Log() })
 }
 
 // TestInvariantChecker: violations are detected after every core input,

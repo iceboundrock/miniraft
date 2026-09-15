@@ -90,11 +90,11 @@ Follower ──ElectionTimeout──▶ Candidate: term+1, votedFor=self  [SaveT
                                                              StopElectionTimer, ResetHeartbeatTimer
         any message with a higher term ──▶ Follower in that term, votedFor=none  [SaveTermVote]
 
-Leader ──HeartbeatTimeout──▶ AppendEntries(term, prevLogIndex, prevLogTerm, no entries) → every peer
+Leader ──HeartbeatTimeout──▶ AppendEntries(term, prevLogIndex, prevLogTerm, log[nextIndex:]) → every peer
                              ResetHeartbeatTimer
    follower: term < currentTerm → Success=false, timer untouched
              else leaderID=sender, ResetElectionTimer,
-                  Success = log has (prevLogIndex, prevLogTerm)
+                  Success = log has (prevLogIndex, prevLogTerm)  (see Log replication)
 ```
 
 Rules worth knowing because they are easy to get subtly wrong:
@@ -138,9 +138,12 @@ Rules worth knowing because they are easy to get subtly wrong:
 
 ### Heartbeats
 
-A Leader keeps its authority by broadcasting an empty `AppendEntries` to
-every peer each time its heartbeat timer fires (`HeartbeatTimeout()`), then
-re-arming the timer. `Config` requires `HeartbeatInterval <= ElectionTimeoutMin/3`,
+A Leader keeps its authority by sending an `AppendEntries` to every peer
+each time its heartbeat timer fires (`HeartbeatTimeout()`), then re-arming
+the timer. A heartbeat is not a special message: it is the same
+`sendAppendEntries(peer)` used by replication, so it carries whatever
+entries the peer is missing (`log[nextIndex[peer]:]`) and is empty only when
+the peer is up to date. `Config` requires `HeartbeatInterval <= ElectionTimeoutMin/3`,
 so a follower has to miss several heartbeats in a row before it starts an
 election. `internal/raft/replication.go` holds the receiver side:
 
@@ -154,23 +157,106 @@ election. `internal/raft/replication.go` holds the receiver side:
   Leader's `AppendEntries` in its own term is an Election Safety violation
   and is reported as an error with no state change.
 - **Recognize the Leader**: record `LeaderID` (visible in `Status`) and reset
-  the election timer. This happens on *every* accepted heartbeat, and even
-  when the consistency check below fails — a legitimate Leader whose log
-  differs from ours is still the Leader; the log is repaired by
+  the election timer. This happens on *every* accepted `AppendEntries`, and
+  even when the consistency check below fails — a legitimate Leader whose
+  log differs from ours is still the Leader; the log is repaired by
   replication, not by an election.
 - **Consistency check**: `raftLog.matches(PrevLogIndex, PrevLogTerm)`
-  decides `Success`; on success `MatchIndex = PrevLogIndex` (nothing was
-  appended). Index 0 always matches, so a heartbeat to an empty log
-  succeeds.
+  decides `Success`. Index 0 always matches, so an `AppendEntries` to an
+  empty log succeeds.
 
-The Leader logs each `AppendEntriesResponse` (`HeartbeatAck`) and, for now,
-does nothing else with it; `nextIndex`/`matchIndex` bookkeeping, carrying
-entries and `LeaderCommit` propagation are later issues (`AppendEntries`
-with entries currently returns `ErrNotImplemented` after honoring the
-heartbeat part). The simulator's `Cluster.StopHeartbeats(id)` drops that
-node's outgoing `AppendEntries` — and nothing else — to simulate a stalled
-Leader; `Cluster.RunFor(d)` advances the clock by a duration. Multi-round
-election runs are issue #17.
+The simulator's `Cluster.StopHeartbeats(id)` drops that node's outgoing
+`AppendEntries` — and nothing else — to simulate a stalled Leader;
+`Cluster.RunFor(d)` advances the clock by a duration. Multi-round election
+runs are issue #17.
+
+### Log replication
+
+`Propose(cmd)` on the Leader appends `{Index: lastIndex+1, Term: currentTerm, cmd}`
+to storage and memory, sets `matchIndex[self]`, and returns the new index
+together with one `AppendEntries` per peer — the entry goes out immediately,
+not on the next heartbeat. On any other node it returns a `*NotLeaderError`
+(`errors.Is(err, ErrNotLeader)`) carrying the Leader hint the node last
+heard from, or `None` if it knows of none. §5.3 of the paper, as implemented
+in `internal/raft/replication.go`:
+
+```
+Leader                                            Follower
+  nextIndex[p]=lastIndex+1, matchIndex[p]=0 on election
+  send prev=(nextIndex-1, term at it), entries=log[nextIndex:]
+                                        ──▶       log has (prevIndex, prevTerm)?
+                                                    no  → Success=false                 [nothing changes]
+                                                    yes → for each entry, in order:
+                                                            index beyond my log   → append the rest       [AppendEntries]
+                                                            same index, same term → skip (already have it)
+                                                            same index, other term→ TruncateSuffix(index)  [TruncateSuffix]
+                                                                                    then append the rest   [AppendEntries]
+                                                          Success=true, MatchIndex=prevIndex+len(entries)
+  Success=false → nextIndex[p] = max(nextIndex[p]-1, matchIndex[p]+1), resend at once
+  Success=true  → matchIndex[p] = max(matchIndex[p], MatchIndex), nextIndex[p] = matchIndex[p]+1
+```
+
+Rules worth knowing:
+
+- **Skip, don't truncate, on a same-term entry**: an `AppendEntries` may be
+  duplicated or arrive after a newer one has already appended more. Deleting
+  everything after `prevLogIndex` and re-appending would throw away the
+  newer entries; Figure 2 says to truncate only at a *conflicting* entry
+  (same index, different term), and only from there. The follower is
+  therefore idempotent: replaying any earlier `AppendEntries` is a no-op.
+- **Empty `AppendEntries` never deletes anything**: a follower with extra
+  entries beyond the Leader's log ((c) and (d) in Figure 7 of the paper)
+  keeps them until the Leader's next entry at that index conflicts with
+  them. This is the paper's behavior, not a shortcut.
+- **`matchIndex` never moves backwards**: a delayed or duplicated ack for an
+  older batch reports a smaller `MatchIndex`; `max` keeps the newer value.
+  `MatchIndex` in the response (an addition to Figure 2) lets the Leader
+  update `matchIndex` without matching acks to requests. An ack claiming
+  more than the Leader's own `lastIndex` is a protocol error and is reported
+  as such.
+- **Rollback floor**: `nextIndex` is decremented one entry per rejection,
+  the MVP strategy of AGENTS.md (the conflict-term optimization of §5.3 is
+  out of scope), but never below `matchIndex+1`: a stale rejection
+  arriving after a success cannot make the Leader resend entries the
+  follower has acknowledged.
+- **Leader Append-Only is asserted, not assumed**: `truncateSuffix` panics
+  if ever called on a Leader. A same-term `AppendEntries` from another
+  Leader is refused before it gets there (Election Safety), so the panic
+  guards against a bug, not a message.
+- **Storage first, reply after**: the follower truncates and appends in
+  storage before touching its in-memory log, and replies only when both
+  succeeded; a storage error returns the error to the host with no reply,
+  so the Leader retries later instead of counting a match that was never
+  persisted. Memory reflects exactly what storage holds even when the
+  second write (append after truncate) fails.
+
+Timeline events: `Propose`, `AppendEntriesSend(peer, prevIndex, prevTerm, n)`,
+`AppendEntriesReject(prevIndex, prevTerm, lastIndex, lastTerm)`,
+`TruncateSuffix(index, lastIndex)`, `AppendEntriesAck(peer, success, matchIndex)`,
+`MatchIndexAdvance(peer, matchIndex)`. Not yet: `commitIndex`/`LeaderCommit`
+handling and apply (issue #8), so `Applied` never fires and `Propose`
+returns as soon as the entry is in the Leader's own log.
+
+In the simulator, `Cluster.Propose(cmd)` routes to `Leader()` (an error
+when there is none), `SimNode.Propose(cmd)` targets one node — both return
+the client's answer rather than recording it in `Errors()` — and
+`Cluster.LogsConverged()` is the usual `RunUntil` predicate: every node
+connected to the Leader holds exactly the Leader's persisted log.
+"Connected" follows the direction replication flows: the Leader -> node
+link is open, whether or not the node can answer (a follower whose replies
+are lost still receives and persists what the Leader sends). Nodes the
+Leader cannot send to are ignored, so a partition test can run until the
+Leader's side agrees while an isolated node is still divergent; that side
+need not be a quorum, because the predicate is about replication rather
+than commit. It is never vacuous: a Leader that has peers but reaches none
+of them reads false, so `RunUntil` does not return before anything was
+replicated (a single-node cluster, having no followers, is converged as
+soon as it has a Leader).
+`SimNode.Log()` reads the log back from storage. A node whose
+`MemoryStorage` was closed by a test answers every write with
+`storage.ErrClosed`; the invariant checker skips its log until it is
+readable again, and `LogsConverged()` is false while it is closed, as it
+is for a scripted core that has no storage to observe.
 
 ### Persistence
 
@@ -185,9 +271,14 @@ keeps a node's persistent state in one directory of human-readable JSON:
 
 Guaranteed: a write is durable when `SaveTermVote`/`AppendEntries` returns;
 `state.json` is never half-written; a partial trailing line left by a crash
-mid-append is discarded on `Open` (that append was never acknowledged). Not
-guaranteed: per-entry checksums, torn-write protection finer than one line,
-log rotation or compaction, a lock against two processes on one directory.
+mid-append is discarded on `Open` (that append was never acknowledged); a
+failed `AppendEntries` truncates the file back to its previous length and
+fsyncs the cut, so the retry the core makes appends the batch exactly once.
+If that rollback fails, or an atomic replace fails after its rename, the
+store fails closed: every call returns `storage.ErrFailed` and the process
+must reopen the directory (a restart reconciles the file). Not guaranteed:
+per-entry checksums, torn-write protection finer than one line, log
+rotation or compaction, a lock against two processes on one directory.
 Corruption before the last line is an error from `Open`, never repaired.
 `MemoryStorage` and `FileStorage` pass the same conformance suite
 (`go test ./internal/storage/ -run TestStorageConformance -v`).
@@ -226,12 +317,17 @@ every test is reproducible from its seed. Its pieces:
   election right now (how the split-vote test creates two simultaneous
   candidates by construction rather than by seed hunting).
 - **Invariant checker** — after every core input the cluster observes every
-  node's `Status()` and records violations of Election Safety (at most one
-  Leader per term over the whole run), Term Monotonicity (a node's term never
-  decreases) and Vote Safety (a node never votes for two different nodes
-  within one term — every non-empty vote is compared against the first one
-  observed for that node and term, so a vote that is cleared and re-granted
-  to someone else is still caught).
+  node's `Status()` and storage and records violations of Election Safety
+  (at most one Leader per term over the whole run), Term Monotonicity (a
+  node's term never decreases), Vote Safety (a node never votes for two
+  different nodes within one term — every non-empty vote is compared
+  against the first one observed for that node and term, so a vote that is
+  cleared and re-granted to someone else is still caught), Log Matching
+  (for every pair of nodes, an entry with the same index and term implies
+  identical logs up to it, commands included), Leader Append-Only (while a
+  node leads a term, the log it had last time must be a prefix of the one
+  it has now) and Storage Consistency (`Status().LastLogIndex/LastLogTerm`
+  match the last entry actually persisted).
   `AssertInvariants()` returns them; the test helper calls it at the end of
   every simulator test.
 

@@ -1,6 +1,7 @@
 package simulator
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -17,7 +18,7 @@ type Core interface {
 	Step(msg raft.Message) ([]raft.Action, error)
 	ElectionTimeout() ([]raft.Action, error)
 	HeartbeatTimeout() ([]raft.Action, error)
-	Propose(cmd []byte) ([]raft.Action, error)
+	Propose(cmd []byte) (raft.Index, []raft.Action, error)
 	Status() raft.Status
 }
 
@@ -49,6 +50,40 @@ func (n *SimNode) ID() raft.NodeID { return n.id }
 
 // Status returns the core's observable state.
 func (n *SimNode) Status() raft.Status { return n.core.Status() }
+
+// errNoStorage is loadLog's answer for a node without a Storage: there is
+// no persisted log to observe, which is not the same as an empty one.
+var errNoStorage = errors.New("simulator: node has no Storage")
+
+// Log returns the node's persisted log, read back from Storage. Tests
+// compare what nodes have actually written, not what a core claims. It
+// panics when the node has no Storage (a scripted core) or the store is
+// closed: a test that asks for a log that cannot be read is asking for
+// something that does not exist.
+func (n *SimNode) Log() []raft.LogEntry {
+	log, err := n.loadLog()
+	if err != nil {
+		panic(fmt.Sprintf("simulator: node %s: load storage: %v", n.id, err))
+	}
+	return log
+}
+
+// loadLog is Log for the harness itself: a missing or closed store is
+// reported as an error (errNoStorage, storage.ErrClosed) instead of a
+// panic, because the invariant checker and LogsConverged run after every
+// input and must keep going when a node has no store or a test has closed
+// one to make its writes fail. An error means "not observable", never
+// "empty".
+func (n *SimNode) loadLog() ([]raft.LogEntry, error) {
+	if n.Storage == nil {
+		return nil, errNoStorage
+	}
+	st, err := n.Storage.Load()
+	if err != nil {
+		return nil, err
+	}
+	return st.Entries, nil
+}
 
 // ElectionTimerArmed reports whether an election timer is pending.
 func (n *SimNode) ElectionTimerArmed() bool { return n.electionTimer != 0 }
@@ -82,10 +117,24 @@ func (n *SimNode) HandleMessage(msg raft.Message) {
 	n.drive(func() ([]raft.Action, error) { return n.core.Step(msg) })
 }
 
-// Propose submits a client command to the core.
-func (n *SimNode) Propose(cmd []byte) {
-	n.logger.Info("Propose", "command", string(cmd))
-	n.drive(func() ([]raft.Action, error) { return n.core.Propose(cmd) })
+// Propose submits a client command to the core and returns the index the
+// core assigned to it. Unlike the other inputs, the error is returned to the
+// caller instead of being recorded in Errors(): a rejected proposal
+// (raft.ErrNotLeader on a follower) is the protocol answering a client, not
+// the core misbehaving.
+func (n *SimNode) Propose(cmd []byte) (raft.Index, error) {
+	n.logger.Info("ClientPropose", "command", string(cmd))
+	var idx raft.Index
+	var err error
+	n.drive(func() ([]raft.Action, error) {
+		var actions []raft.Action
+		idx, actions, err = n.core.Propose(cmd)
+		return actions, nil
+	})
+	if err != nil {
+		n.logger.Info("ClientProposeRejected", "err", err)
+	}
+	return idx, err
 }
 
 // drive calls one core input, records an error if it returns one, executes

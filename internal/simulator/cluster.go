@@ -240,6 +240,69 @@ func (c *Cluster) Leader() *SimNode {
 	return best
 }
 
+// Propose submits a client command to the current Leader (see Leader) and
+// returns the log index it was assigned. It fails when no unique Leader
+// exists; the caller decides whether to wait for one and retry.
+func (c *Cluster) Propose(cmd []byte) (raft.Index, error) {
+	leader := c.Leader()
+	if leader == nil {
+		return 0, fmt.Errorf("simulator: Propose(%q): no Leader", cmd)
+	}
+	return leader.Propose(cmd)
+}
+
+// LogsConverged reports whether every node connected to the Leader holds
+// exactly the Leader's persisted log. "Connected" is the set replication
+// can actually reach, and replication flows one way: a node is connected
+// when the Leader -> node link is open, whether or not the node's link back
+// to the Leader is. A follower that cannot answer still receives every
+// AppendEntries and persists what the Leader sends, so it is compared like
+// any other; the reverse link only decides whether the Leader learns of it
+// (matchIndex, nextIndex rollback), which is not what this predicate
+// observes. Nodes the Leader cannot send to are ignored, so a partition
+// test can run "until the Leader's side agrees" while a divergent isolated
+// node is left behind (it converges once the network heals). The Leader's
+// side need not be a quorum: this predicate is about replication, which
+// reaches whatever the network lets it reach, not about commit.
+//
+// Convergence is observed, not assumed: a Leader that has peers but can
+// reach none of them reads false rather than vacuously true, so RunUntil
+// keeps running instead of returning before anything was replicated. A
+// single-node cluster has no follower to observe and is converged as soon
+// as it has a Leader.
+//
+// It is false without a unique Leader and false while a compared log
+// cannot be read: a closed store, or a scripted core without a Storage (a
+// log nobody can observe is not known to agree).
+func (c *Cluster) LogsConverged() bool {
+	leader := c.Leader()
+	if leader == nil {
+		return false
+	}
+	want, err := leader.loadLog()
+	if err != nil {
+		return false
+	}
+	followers := 0
+	for _, id := range c.ids {
+		n := c.nodes[id]
+		if n == leader || !c.network.Connected(leader.id, id) {
+			continue
+		}
+		followers++
+		log, err := n.loadLog()
+		if err != nil || !slices.EqualFunc(log, want, sameEntry) {
+			return false
+		}
+	}
+	return followers > 0 || len(c.ids) == 1
+}
+
+// sameEntry reports whether two entries are identical, command included.
+func sameEntry(a, b raft.LogEntry) bool {
+	return a.Index == b.Index && a.Term == b.Term && bytes.Equal(a.Command, b.Command)
+}
+
 // Run executes every event up to and including absolute time until, then
 // sets the clock to until. Run(Now()) fires events due right now; a past
 // until is a no-op. Run, Step and RunUntil belong to the test driver: calling

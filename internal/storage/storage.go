@@ -21,7 +21,12 @@
 // survives a crash; state.json is never seen half-written; a crash mid-append
 // leaves a partial trailing line that Open discards as "the append did not
 // happen" (it was never acknowledged), trimming the file so the next append
-// is well-formed.
+// is well-formed. A failed AppendEntries rolls the file back to its previous
+// length and fsyncs the cut, so the core's retry appends the batch once. When
+// FileStorage cannot restore a known state (the rollback fails, or an atomic
+// replace fails after its rename) it fails closed: every later call returns
+// an error wrapping ErrFailed and the process must reopen the directory, at
+// which point the load rules reconcile whatever the failed write left.
 //
 // Not guaranteed: no per-entry checksum, no torn-write protection finer than
 // a line, no segment rotation or compaction, no lock against two processes
