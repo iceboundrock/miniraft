@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/iceboundrock/miniraft/internal/raft"
+	"github.com/iceboundrock/miniraft/internal/statemachine"
 	"github.com/iceboundrock/miniraft/internal/storage"
 )
 
@@ -29,7 +30,9 @@ func requireNoErrors(t *testing.T, c *Cluster) {
 }
 
 // preloaded returns a MemoryStorage holding term/vote and a log built from
-// (index, term) pairs.
+// (index, term) pairs. Each entry is a valid KV command naming its own
+// index and term, so preloaded entries can be committed and applied, and
+// two entries are equal only if their (index, term) are.
 func preloaded(t *testing.T, term raft.Term, votedFor raft.NodeID, pairs ...[2]uint64) *storage.MemoryStorage {
 	t.Helper()
 	st := storage.NewMemoryStorage()
@@ -38,7 +41,7 @@ func preloaded(t *testing.T, term raft.Term, votedFor raft.NodeID, pairs ...[2]u
 	}
 	var entries []raft.LogEntry
 	for _, p := range pairs {
-		entries = append(entries, raft.LogEntry{Index: raft.Index(p[0]), Term: raft.Term(p[1]), Command: []byte{byte(p[0])}})
+		entries = append(entries, raft.LogEntry{Index: raft.Index(p[0]), Term: raft.Term(p[1]), Command: statemachine.Set("pre", fmt.Sprintf("%d.%d", p[0], p[1]))})
 	}
 	if err := st.AppendEntries(entries); err != nil {
 		t.Fatal(err)

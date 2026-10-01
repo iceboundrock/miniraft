@@ -30,8 +30,10 @@ func candidateLogUpToDate(candLastTerm Term, candLastIndex Index, localLastTerm 
 	return candLastIndex >= localLastIndex
 }
 
-// quorum is the number of votes (including the node's own) that forms a
-// majority of the cluster.
+// quorum is the number of nodes (this one included) that forms a majority
+// of the fixed cluster of len(Peers)+1: enough votes to win an election, and
+// enough replicas (matchIndex) to commit an entry. Any two quorums overlap,
+// which is what both Election Safety and Leader Completeness rest on.
 func (n *Node) quorum() int {
 	return (len(n.peers)+1)/2 + 1
 }
@@ -64,9 +66,9 @@ func (n *Node) Start() []Action {
 func (n *Node) ElectionTimeout() ([]Action, error) {
 	n.logger.Info("ElectionTimeout", "term", n.currentTerm, "role", n.role)
 	if n.role == Leader {
-		return nil, nil
+		return n.finish(nil, nil)
 	}
-	return n.becomeCandidate()
+	return n.finish(n.becomeCandidate())
 }
 
 // becomeCandidate starts an election (§5.2): increment currentTerm, vote for

@@ -2,6 +2,7 @@ package simulator
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/iceboundrock/miniraft/internal/raft"
+	"github.com/iceboundrock/miniraft/internal/statemachine"
 	"github.com/iceboundrock/miniraft/internal/storage"
 )
 
@@ -21,7 +23,16 @@ const (
 	DefaultElectionTimeoutMax = 300 * time.Millisecond
 	DefaultHeartbeatInterval  = 50 * time.Millisecond
 	DefaultLatency            = 5 * time.Millisecond
+	// DefaultSubmitTimeout is several election timeouts: long enough for a
+	// healthy cluster to commit, short enough that a Leader without a
+	// majority fails a test quickly.
+	DefaultSubmitTimeout = time.Second
 )
+
+// ErrSubmitTimeout is returned by Submit and Await when the proposal was not
+// applied on the proposing node within Config.SubmitTimeout. The outcome is unknown:
+// the entry may still be committed later.
+var ErrSubmitTimeout = errors.New("simulator: submit timed out before the proposal was applied")
 
 // Config describes a simulated cluster.
 type Config struct {
@@ -41,6 +52,10 @@ type Config struct {
 	MinLatency time.Duration
 	MaxLatency time.Duration
 
+	// SubmitTimeout bounds how much simulated time Submit and Await run
+	// while waiting for a proposal to be applied.
+	SubmitTimeout time.Duration
+
 	// Stores optionally supplies the storage a node is built over, so a
 	// test can pre-load a term, a vote or a log. Nodes not listed get a
 	// fresh MemoryStorage. Every key must also appear in NodeIDs.
@@ -58,6 +73,9 @@ func (cfg Config) withDefaults() Config {
 	if cfg.MinLatency == 0 && cfg.MaxLatency == 0 {
 		cfg.MinLatency = DefaultLatency
 		cfg.MaxLatency = DefaultLatency
+	}
+	if cfg.SubmitTimeout == 0 {
+		cfg.SubmitTimeout = DefaultSubmitTimeout
 	}
 	return cfg
 }
@@ -78,21 +96,19 @@ type Cluster struct {
 	inv      invariants
 }
 
-// nopStateMachine stands in for the KV state machine of a later issue.
-type nopStateMachine struct{}
-
-func (nopStateMachine) Apply(raft.LogEntry) ([]byte, error) { return nil, nil }
-
 // NewCluster builds the harness and one raft.Node per NodeID, each over a
-// fresh storage.MemoryStorage (or the one given in Config.Stores) and a
-// no-op state machine, and executes every node's Start actions, so a fresh
-// cluster has one election timer per node pending at time 0.
+// fresh storage.MemoryStorage (or the one given in Config.Stores) and its
+// own empty statemachine.KV, and executes every node's Start actions, so a
+// fresh cluster has one election timer per node pending at time 0.
 func NewCluster(cfg Config) (*Cluster, error) {
 	cfg = cfg.withDefaults()
 	// NewNetwork panics on a bad range; a Config error belongs on this
 	// constructor's error path like every other invalid setting.
 	if cfg.MinLatency < 0 || cfg.MaxLatency < cfg.MinLatency {
 		return nil, fmt.Errorf("simulator: invalid latency range [%v, %v]", cfg.MinLatency, cfg.MaxLatency)
+	}
+	if cfg.SubmitTimeout < 0 {
+		return nil, fmt.Errorf("simulator: negative SubmitTimeout %v", cfg.SubmitTimeout)
 	}
 	c := &Cluster{
 		cfg:   cfg,
@@ -127,6 +143,7 @@ func NewCluster(cfg Config) (*Cluster, error) {
 		if st == nil {
 			st = storage.NewMemoryStorage()
 		}
+		sm := statemachine.NewKV()
 		node, err := raft.NewNode(raft.Config{
 			ID:                 id,
 			Peers:              peers,
@@ -135,11 +152,12 @@ func NewCluster(cfg Config) (*Cluster, error) {
 			HeartbeatInterval:  cfg.HeartbeatInterval,
 			Rand:               c.rng,
 			Logger:             c.logger,
-		}, st, nopStateMachine{})
+		}, st, sm)
 		if err != nil {
 			return nil, fmt.Errorf("simulator: node %q: %w", id, err)
 		}
-		c.AddNode(id, node).Storage = st
+		n := c.AddNode(id, node)
+		n.Storage, n.StateMachine = st, sm
 	}
 	// Executed only once every node is registered, so that no action can
 	// address a node that does not exist yet.
@@ -241,14 +259,74 @@ func (c *Cluster) Leader() *SimNode {
 }
 
 // Propose submits a client command to the current Leader (see Leader) and
-// returns the log index it was assigned. It fails when no unique Leader
-// exists; the caller decides whether to wait for one and retry.
-func (c *Cluster) Propose(cmd []byte) (raft.Index, error) {
+// returns the log index and term it was assigned, without waiting for the
+// outcome. It fails when no unique Leader exists; the caller decides
+// whether to wait for one and retry.
+func (c *Cluster) Propose(cmd []byte) (raft.Index, raft.Term, error) {
 	leader := c.Leader()
 	if leader == nil {
-		return 0, fmt.Errorf("simulator: Propose(%q): no Leader", cmd)
+		return 0, 0, fmt.Errorf("simulator: Propose(%q): no Leader", cmd)
 	}
 	return leader.Propose(cmd)
+}
+
+// Submit is the client's whole request: it proposes cmd to the current
+// Leader and waits for the outcome with Await, so success is reported only
+// once the command is committed and applied on that node. There is no
+// retry or deduplication: after ErrSubmitTimeout the command may still be
+// committed later.
+//
+// Like Run, Submit belongs to the test driver and advances the clock.
+func (c *Cluster) Submit(cmd []byte) ([]byte, error) {
+	leader := c.Leader()
+	if leader == nil {
+		return nil, fmt.Errorf("simulator: Submit(%q): no Leader", cmd)
+	}
+	idx, term, err := leader.Propose(cmd)
+	if err != nil {
+		return nil, err
+	}
+	return c.Await(leader, idx, term)
+}
+
+// Await is the host's half of the proposal lifecycle (see raft.Node.Propose):
+// it runs the simulation until node n applies index and reports the outcome
+// of the proposal that n's Propose returned as (index, term). If the entry
+// applied there has that term, the result is the state machine's. If it has
+// another term, a later Leader's entry replaced the proposal: Await returns
+// raft.ErrProposalLost. If n applies nothing at index within
+// Config.SubmitTimeout (the Leader cannot reach a majority, say), it returns
+// ErrSubmitTimeout. Submit is Propose followed by Await; a test calls Await
+// itself when it must change the network between the two.
+//
+// Like Run, Await belongs to the test driver and advances the clock.
+func (c *Cluster) Await(n *SimNode, index raft.Index, term raft.Term) ([]byte, error) {
+	var got raft.Applied
+	applied := func() bool {
+		var ok bool
+		got, ok = n.appliedAt(index)
+		return ok
+	}
+	if !c.RunUntil(applied, c.Now()+c.cfg.SubmitTimeout) {
+		return nil, fmt.Errorf("%w: entry %d (term %d) on %s", ErrSubmitTimeout, index, term, n.id)
+	}
+	if got.Term != term {
+		return nil, fmt.Errorf("%w: entry %d was proposed in term %d, %s applied the one from term %d",
+			raft.ErrProposalLost, index, term, n.id, got.Term)
+	}
+	return got.Result, nil
+}
+
+// StateMachines returns the KV of every node that has one (those created
+// by NewCluster).
+func (c *Cluster) StateMachines() map[raft.NodeID]*statemachine.KV {
+	out := make(map[raft.NodeID]*statemachine.KV, len(c.ids))
+	for _, id := range c.ids {
+		if sm := c.nodes[id].StateMachine; sm != nil {
+			out[id] = sm
+		}
+	}
+	return out
 }
 
 // LogsConverged reports whether every node connected to the Leader holds

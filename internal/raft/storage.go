@@ -43,6 +43,11 @@ type Storage interface {
 // applied to, strictly in index order. Implementations live in
 // internal/statemachine.
 type StateMachine interface {
-	// Apply executes the entry's command and returns its result.
+	// Apply executes the entry's command and returns its result. It must be
+	// deterministic — the result and the new state depend only on the
+	// current state and the command — so that replicas applying the same
+	// log agree. An error means the entry was not applied and the state is
+	// unchanged: the node stops applying at that entry, returns the error to
+	// its host and tries the entry again on its next input.
 	Apply(entry LogEntry) ([]byte, error)
 }

@@ -29,6 +29,15 @@ func (e *NotLeaderError) Error() string {
 
 func (e *NotLeaderError) Unwrap() error { return ErrNotLeader }
 
+// ErrProposalLost is what a host reports to a client whose proposal will
+// never be applied: the node applied the proposal's index, but the entry
+// there has a different term than the one Propose returned. A later Leader's
+// entry replaced the proposal before it was committed (the proposing Leader
+// lost leadership), and by State Machine Safety the replaced entry can never
+// be applied anywhere. The core itself never returns it — it does not track
+// client requests — but defines it so every host reports the outcome alike.
+var ErrProposalLost = errors.New("raft: proposal lost: a different entry was committed at its index")
+
 // ErrTermOverflow is returned when starting an election would advance
 // currentTerm past the maximum Term. Wrapping to 0 would violate Term
 // Monotonicity, so the node refuses instead; it can still vote and follow
@@ -214,7 +223,8 @@ func (n *Node) Status() Status {
 //
 // The "higher term seen" rule (Figure 2, All Servers) then runs for every
 // message type: a message from a later term makes this node a Follower in
-// that term before the message itself is handled.
+// that term before the message itself is handled. Like every input, a
+// successful Step ends by applying newly committed entries (finish).
 //
 // Step is two transitions in sequence, each atomic on its own. If the
 // step-down succeeded and only the handler's storage write failed, the node
@@ -223,6 +233,11 @@ func (n *Node) Status() Status {
 // ResetElectionTimer must reach the host, or it keeps a heartbeat timer for
 // a node that is no longer Leader and never arms an election timer.
 func (n *Node) Step(msg Message) ([]Action, error) {
+	return n.finish(n.step(msg))
+}
+
+// step is Step without the final apply.
+func (n *Node) step(msg Message) ([]Action, error) {
 	if err := msg.Validate(); err != nil {
 		return nil, err
 	}
@@ -262,28 +277,36 @@ func (n *Node) Step(msg Message) ([]Action, error) {
 }
 
 // Propose asks the node, if it is Leader, to append cmd to the log (§5.3).
-// It returns the index the entry was assigned and the AppendEntries that
-// start replicating it; the entry is only proposed, not committed — the
-// host learns of commit and apply through later actions. A non-Leader
+// It returns the index and term the entry was assigned and the
+// AppendEntries that start replicating it. The entry is only proposed: the
+// host learns the outcome from a later Applied action for that index —
+// success if its Term is the returned term, ErrProposalLost if it is
+// another. There is no retry or deduplication: a host that stops waiting
+// cannot tell whether the entry will still be committed. A non-Leader
 // returns a *NotLeaderError with no actions.
 //
 // The entry is written to Storage before it exists in memory, like every
 // other persistent-state change: a failed append leaves the log unchanged,
-// returns the error and sends nothing.
-func (n *Node) Propose(cmd []byte) (Index, []Action, error) {
+// returns the error and sends nothing. In a single-node cluster the Leader
+// is a majority by itself, so the entry is committed and applied right
+// here; if that apply fails, the index and term are still returned, with
+// the error and the actions, because the entry is in the log.
+func (n *Node) Propose(cmd []byte) (Index, Term, []Action, error) {
 	if n.role != Leader {
-		return 0, nil, &NotLeaderError{LeaderID: n.leaderID}
+		return 0, 0, nil, &NotLeaderError{LeaderID: n.leaderID}
 	}
 	entry := LogEntry{Index: n.log.lastIndex() + 1, Term: n.currentTerm, Command: cmd}
 	if err := n.storage.AppendEntries([]LogEntry{entry}); err != nil {
-		return 0, nil, fmt.Errorf("raft: persist entry %d: %w", entry.Index, err)
+		return 0, 0, nil, fmt.Errorf("raft: persist entry %d: %w", entry.Index, err)
 	}
 	n.log.append(entry)
 	n.matchIndex[n.id] = entry.Index
 	n.logger.Info("Propose", "term", n.currentTerm, "role", n.role, "index", entry.Index)
+	n.maybeAdvanceCommit()
 	actions := make([]Action, 0, len(n.peers))
 	for _, p := range n.peers {
 		actions = append(actions, n.sendAppendEntries(p))
 	}
-	return entry.Index, actions, nil
+	actions, err := n.finish(actions, nil)
+	return entry.Index, entry.Term, actions, err
 }

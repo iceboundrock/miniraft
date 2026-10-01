@@ -1,6 +1,7 @@
 package simulator
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strings"
@@ -31,6 +32,25 @@ import (
 //   - Storage Consistency: Status().LastLogIndex/LastLogTerm agree with the
 //     last entry in the node's Storage. Not a Raft invariant but the
 //     precondition for trusting the two above, which read Storage.
+//   - Monotonic Progress: a node's commitIndex and lastApplied never
+//     decrease.
+//   - Apply/Commit Bounds: lastApplied <= commitIndex <= lastLogIndex.
+//   - State Machine Safety, on the log: every node holds the same entry at
+//     every index it has committed. The committed log is recorded from the
+//     first node seen to commit each index, and every later observation is
+//     compared against it.
+//   - Leader Completeness: a Leader holds every committed entry whose
+//     commit was observed in an earlier term than its own (Raft §5.4). Each
+//     recorded entry keeps the term of the node that first reported it
+//     committed; that node's term is at least the term in which the entry
+//     was committed, so requiring it of Leaders of later terms is sound.
+//     A deposed Leader of an older term may lack it, which is legal.
+//   - State Machine Safety, on what was applied: two nodes that apply the
+//     same index apply the same entry (same term) with the same result.
+//     Each node's apply history (its Applied actions) is compared against
+//     the first one recorded for every index.
+//   - Apply Order: a node's Applied actions go strictly in index order,
+//     1, 2, 3, ...
 //
 // The log invariants read each node's Storage and are skipped for nodes
 // without one (scripted cores) and for nodes whose store is closed: the
@@ -47,7 +67,17 @@ type invariants struct {
 	votes      map[voteKey]raft.NodeID     // first non-empty vote observed per node and term
 	last       map[raft.NodeID]raft.Status // last Status observed per node
 	leaderLogs map[voteKey][]raft.LogEntry // last log observed per Leader and term
+	committed  []committedEntry            // the committed log: index i at position i-1
+	applied    []raft.Applied              // first Applied recorded per index: index i at position i-1
+	checked    map[raft.NodeID]int         // how much of each node's apply history has been checked
 	violations []error
+}
+
+// committedEntry is an entry of the committed log, with the term of the
+// node that was first seen to have committed it.
+type committedEntry struct {
+	entry raft.LogEntry
+	term  raft.Term
 }
 
 // voteKey identifies one node's vote in one term.
@@ -65,11 +95,14 @@ func (c *Cluster) checkInvariants() {
 		c.inv.votes = make(map[voteKey]raft.NodeID)
 		c.inv.last = make(map[raft.NodeID]raft.Status)
 		c.inv.leaderLogs = make(map[voteKey][]raft.LogEntry)
+		c.inv.checked = make(map[raft.NodeID]int)
 	}
 	logs := make(map[raft.NodeID][]raft.LogEntry, len(c.ids))
+	statuses := make(map[raft.NodeID]raft.Status, len(c.ids))
 	for _, id := range c.ids {
 		n := c.nodes[id]
 		st := n.Status()
+		statuses[id] = st
 		if log, err := n.loadLog(); err == nil {
 			logs[id] = log
 			c.checkLogInvariants(id, st, log)
@@ -89,11 +122,23 @@ func (c *Cluster) checkInvariants() {
 				c.violate("Vote Safety", "node %s voted for %s and then %s in term %d", id, first, st.VotedFor, st.Term)
 			}
 		}
-		if prev, seen := c.inv.last[id]; seen && st.Term < prev.Term {
-			c.violate("Term Monotonicity", "node %s went from term %d to %d", id, prev.Term, st.Term)
+		if prev, seen := c.inv.last[id]; seen {
+			if st.Term < prev.Term {
+				c.violate("Term Monotonicity", "node %s went from term %d to %d", id, prev.Term, st.Term)
+			}
+			if st.CommitIndex < prev.CommitIndex || st.LastApplied < prev.LastApplied {
+				c.violate("Monotonic Progress", "node %s went from commitIndex %d, lastApplied %d to %d, %d",
+					id, prev.CommitIndex, prev.LastApplied, st.CommitIndex, st.LastApplied)
+			}
+		}
+		if st.LastApplied > st.CommitIndex || st.CommitIndex > st.LastLogIndex {
+			c.violate("Apply/Commit Bounds", "node %s has lastApplied %d, commitIndex %d, lastLogIndex %d",
+				id, st.LastApplied, st.CommitIndex, st.LastLogIndex)
 		}
 		c.inv.last[id] = st
+		c.checkApplied(id, n.applied)
 	}
+	c.checkCommitted(logs, statuses)
 	for i, a := range c.ids {
 		for _, b := range c.ids[i+1:] {
 			if la, ok := logs[a]; ok {
@@ -126,6 +171,82 @@ func (c *Cluster) checkLogInvariants(id raft.NodeID, st raft.Status, log []raft.
 			id, st.Term, describeLog(prev), describeLog(log))
 	}
 	c.inv.leaderLogs[key] = log
+}
+
+// checkCommitted extends the committed log with every index some node has
+// newly committed, and then checks every node against it: the entries a
+// node has committed must be the recorded ones (State Machine Safety), and
+// a Leader must hold every entry committed before its term (Leader
+// Completeness). All nodes extend the record before any is checked, so a
+// Leader is compared against what the whole cluster has committed so far.
+func (c *Cluster) checkCommitted(logs map[raft.NodeID][]raft.LogEntry, statuses map[raft.NodeID]raft.Status) {
+	for _, id := range c.ids {
+		log, ok := logs[id]
+		if !ok {
+			continue
+		}
+		st := statuses[id]
+		for i := len(c.inv.committed); i < int(min(st.CommitIndex, raft.Index(len(log)))); i++ {
+			c.inv.committed = append(c.inv.committed, committedEntry{entry: log[i], term: st.Term})
+		}
+	}
+	for _, id := range c.ids {
+		log, ok := logs[id]
+		if !ok {
+			continue
+		}
+		st := statuses[id]
+		for i := range min(int(st.CommitIndex), len(log), len(c.inv.committed)) {
+			if want := c.inv.committed[i].entry; !sameEntry(log[i], want) {
+				c.violate("State Machine Safety", "node %s committed %s at index %d, but %s was committed there",
+					id, describeLog(log[i:i+1]), want.Index, describeLog([]raft.LogEntry{want}))
+				break
+			}
+		}
+		if st.Role != raft.Leader {
+			continue
+		}
+		for i, ce := range c.inv.committed {
+			if ce.term >= st.Term {
+				continue
+			}
+			if i >= len(log) || !sameEntry(log[i], ce.entry) {
+				c.violate("Leader Completeness", "Leader %s of term %d lacks entry %s, committed by term %d",
+					id, st.Term, describeLog([]raft.LogEntry{ce.entry}), ce.term)
+				break
+			}
+		}
+	}
+}
+
+// checkApplied checks the part of node id's apply history not checked yet:
+// each Applied must follow the previous one in index order (Apply Order)
+// and agree in term and result with the first Applied recorded for its
+// index on any node (State Machine Safety).
+func (c *Cluster) checkApplied(id raft.NodeID, history []raft.Applied) {
+	for k := c.inv.checked[id]; k < len(history); k++ {
+		a := history[k]
+		var prev raft.Index
+		if k > 0 {
+			prev = history[k-1].Index
+		}
+		if a.Index != prev+1 {
+			c.violate("Apply Order", "node %s applied entry %d after entry %d", id, a.Index, prev)
+			continue
+		}
+		switch i := int(a.Index) - 1; {
+		case i < len(c.inv.applied):
+			if want := c.inv.applied[i]; a.Term != want.Term || !bytes.Equal(a.Result, want.Result) {
+				c.violate("State Machine Safety", "node %s applied entry %d from term %d with result %q, another node applied it from term %d with result %q",
+					id, a.Index, a.Term, a.Result, want.Term, want.Result)
+			}
+		case i == len(c.inv.applied):
+			c.inv.applied = append(c.inv.applied, a)
+		}
+		// i > len: an earlier index of this node was out of order and is
+		// already reported; there is nothing to compare against.
+	}
+	c.inv.checked[id] = len(history)
 }
 
 // checkLogMatching compares the logs of nodes a and b at the highest index

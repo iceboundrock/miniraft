@@ -49,9 +49,12 @@ func (f *fakeCore) HeartbeatTimeout() ([]raft.Action, error) {
 	return nil, f.err
 }
 
-func (f *fakeCore) Propose(cmd []byte) (raft.Index, []raft.Action, error) {
+func (f *fakeCore) Propose(cmd []byte) (raft.Index, raft.Term, []raft.Action, error) {
 	f.proposals = append(f.proposals, cmd)
-	return raft.Index(len(f.proposals)), nil, f.err
+	if f.err != nil {
+		return 0, 0, nil, f.err
+	}
+	return raft.Index(len(f.proposals)), f.status.Term, nil, nil
 }
 
 func (f *fakeCore) Start() []raft.Action {
@@ -129,13 +132,20 @@ func TestClusterTranslatesActions(t *testing.T) {
 		t.Fatalf("heartbeat=%d election=%d, want 0 and 1", fb.heartbeatTimeouts, fb.electionTimeouts)
 	}
 
-	// Applied is recorded on the timeline; Propose reaches the core.
-	a.Execute([]raft.Action{raft.Applied{Index: 3, Term: 2, Result: []byte("ok")}})
-	if !timelineHas(c, "event=Applied node=a index=3 term=2") {
+	// Applied is recorded on the timeline and in the apply history, with
+	// its own copy of the result; Propose reaches the core.
+	result := []byte("ok")
+	a.Execute([]raft.Action{raft.Applied{Index: 1, Term: 2, Result: result}})
+	result[0] = 'X'
+	if !timelineHas(c, "event=Applied node=a index=1 term=2") {
 		t.Fatal("timeline missing Applied event")
 	}
-	if idx, err := a.Propose([]byte("SET x 1")); idx != 1 || err != nil {
-		t.Fatalf("Propose = (%d, %v), want (1, nil)", idx, err)
+	if h := a.Applied(); len(h) != 1 || h[0].Index != 1 || h[0].Term != 2 || string(h[0].Result) != "ok" {
+		t.Fatalf("Applied() = %+v, want [{1 2 ok}]", h)
+	}
+	fa.status.Term = 2
+	if idx, term, err := a.Propose([]byte("SET x 1")); idx != 1 || term != 2 || err != nil {
+		t.Fatalf("Propose = (%d, %d, %v), want (1, 2, nil)", idx, term, err)
 	}
 	if len(fa.proposals) != 1 || string(fa.proposals[0]) != "SET x 1" {
 		t.Fatalf("proposals = %q", fa.proposals)

@@ -6,9 +6,16 @@
 //
 // Everything runs on the goroutine that calls Cluster.Run, Step or RunUntil;
 // there are no goroutines, mutexes or wall-clock reads, so the same seed
-// always reproduces the same timeline. After every core input the cluster
-// checks the Raft safety invariants it can observe from Status (Election
-// Safety, Term Monotonicity, Vote Safety) and records violations for
+// always reproduces the same timeline. Every node created by NewCluster
+// applies committed entries to its own statemachine.KV, and Cluster.Submit
+// is the client path: propose to the Leader, run until that node has
+// applied the entry, return the result.
+//
+// After every core input the cluster checks the Raft safety invariants it
+// can observe from Status, Storage and the nodes' Applied actions (Election
+// Safety, Term Monotonicity, Vote Safety, Log Matching, Leader Append-Only,
+// Leader Completeness, State Machine Safety, monotonic commit and apply,
+// and their bounds; see invariants) and records violations for
 // AssertInvariants. Crash/restart and seeded drop/duplicate rates are added
 // by a later issue; only the hooks exist here.
 package simulator

@@ -1,12 +1,15 @@
 package simulator
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/iceboundrock/miniraft/internal/raft"
+	"github.com/iceboundrock/miniraft/internal/statemachine"
 	"github.com/iceboundrock/miniraft/internal/storage"
 )
 
@@ -18,7 +21,7 @@ type Core interface {
 	Step(msg raft.Message) ([]raft.Action, error)
 	ElectionTimeout() ([]raft.Action, error)
 	HeartbeatTimeout() ([]raft.Action, error)
-	Propose(cmd []byte) (raft.Index, []raft.Action, error)
+	Propose(cmd []byte) (raft.Index, raft.Term, []raft.Action, error)
 	Status() raft.Status
 }
 
@@ -32,6 +35,10 @@ type SimNode struct {
 	// NewCluster; nil for cores added with AddNode. It is exposed so that a
 	// later issue can "restart" the node over the same store.
 	Storage *storage.MemoryStorage
+	// StateMachine is the node's KV when the node was created by
+	// NewCluster; nil for cores added with AddNode. Tests read it to
+	// compare replicas' applied state.
+	StateMachine *statemachine.KV
 
 	id      raft.NodeID
 	core    Core
@@ -43,6 +50,11 @@ type SimNode struct {
 	// election timer that still fires is the classic "phantom timeout" bug.
 	electionTimer  TimerID
 	heartbeatTimer TimerID
+
+	// applied is every Applied action the core returned, in order: the
+	// node's apply history, read by Submit and by the State Machine Safety
+	// check.
+	applied []raft.Applied
 }
 
 // ID returns the node's identity.
@@ -85,6 +97,21 @@ func (n *SimNode) loadLog() ([]raft.LogEntry, error) {
 	return st.Entries, nil
 }
 
+// Applied returns the node's apply history: every Applied action its core
+// has returned, oldest first.
+func (n *SimNode) Applied() []raft.Applied { return slices.Clone(n.applied) }
+
+// appliedAt returns the Applied action for index, searching from the newest
+// one, and whether there is one.
+func (n *SimNode) appliedAt(index raft.Index) (raft.Applied, bool) {
+	for i := len(n.applied) - 1; i >= 0; i-- {
+		if n.applied[i].Index == index {
+			return n.applied[i], true
+		}
+	}
+	return raft.Applied{}, false
+}
+
 // ElectionTimerArmed reports whether an election timer is pending.
 func (n *SimNode) ElectionTimerArmed() bool { return n.electionTimer != 0 }
 
@@ -117,24 +144,34 @@ func (n *SimNode) HandleMessage(msg raft.Message) {
 	n.drive(func() ([]raft.Action, error) { return n.core.Step(msg) })
 }
 
-// Propose submits a client command to the core and returns the index the
-// core assigned to it. Unlike the other inputs, the error is returned to the
-// caller instead of being recorded in Errors(): a rejected proposal
-// (raft.ErrNotLeader on a follower) is the protocol answering a client, not
-// the core misbehaving.
-func (n *SimNode) Propose(cmd []byte) (raft.Index, error) {
+// Propose submits a client command to the core and returns the index and
+// term the core assigned to it. Unlike the other inputs, a rejection is
+// returned to the caller instead of being recorded in Errors(): a refused
+// proposal (raft.ErrNotLeader on a follower, an append that could not be
+// persisted) is the protocol answering a client, not the core misbehaving.
+// An error that comes with an index means the entry was appended and only
+// applying failed (a single-node cluster commits at once); that is the
+// node's failure, so it goes to Errors() and the proposal is reported as
+// accepted.
+func (n *SimNode) Propose(cmd []byte) (raft.Index, raft.Term, error) {
 	n.logger.Info("ClientPropose", "command", string(cmd))
 	var idx raft.Index
+	var term raft.Term
 	var err error
 	n.drive(func() ([]raft.Action, error) {
 		var actions []raft.Action
-		idx, actions, err = n.core.Propose(cmd)
+		var perr error
+		idx, term, actions, perr = n.core.Propose(cmd)
+		if idx != 0 {
+			return actions, perr
+		}
+		err = perr
 		return actions, nil
 	})
 	if err != nil {
 		n.logger.Info("ClientProposeRejected", "err", err)
 	}
-	return idx, err
+	return idx, term, err
 }
 
 // drive calls one core input, records an error if it returns one, executes
@@ -158,7 +195,7 @@ func (n *SimNode) drive(input func() ([]raft.Action, error)) {
 //	StopElectionTimer    -> stop
 //	ResetHeartbeatTimer  -> stop previous, Clock.After -> core.HeartbeatTimeout
 //	StopHeartbeatTimer   -> stop
-//	Applied              -> timeline entry
+//	Applied              -> apply history (Applied) + timeline entry
 func (n *SimNode) Execute(actions []raft.Action) {
 	clock := n.cluster.clock
 	for _, a := range actions {
@@ -182,6 +219,8 @@ func (n *SimNode) Execute(actions []raft.Action) {
 			n.heartbeatTimer = 0
 			n.logger.Info("StopHeartbeatTimer")
 		case raft.Applied:
+			a.Result = bytes.Clone(a.Result)
+			n.applied = append(n.applied, a)
 			n.logger.Info("Applied", "index", a.Index, "term", a.Term)
 		default:
 			panic(fmt.Sprintf("simulator: unknown action %T", a))
