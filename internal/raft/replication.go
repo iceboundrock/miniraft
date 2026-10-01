@@ -5,8 +5,8 @@ import "fmt"
 // This file implements the AppendEntries RPC (§5.3): the Leader's
 // per-peer replication state (nextIndex/matchIndex), Propose's fan-out and
 // the heartbeat, the follower's consistency check and conflict repair, and
-// the Leader's handling of replies. Commit and apply (LeaderCommit,
-// commitIndex) are a later issue.
+// the Leader's handling of replies. The commit rules both sides apply to
+// the results live in commit.go.
 
 // HeartbeatTimeout tells the node its heartbeat timer fired. A Leader sends
 // AppendEntries to every peer and re-arms the timer; a peer that is caught
@@ -17,7 +17,7 @@ import "fmt"
 func (n *Node) HeartbeatTimeout() ([]Action, error) {
 	if n.role != Leader {
 		n.logger.Info("HeartbeatTimeout", "term", n.currentTerm, "role", n.role, "ignored", true)
-		return nil, nil
+		return n.finish(nil, nil)
 	}
 	n.logger.Info("Heartbeat", "term", n.currentTerm, "role", n.role,
 		"lastIndex", n.log.lastIndex(), "commitIndex", n.commitIndex)
@@ -25,7 +25,7 @@ func (n *Node) HeartbeatTimeout() ([]Action, error) {
 	for _, p := range n.peers {
 		actions = append(actions, n.sendAppendEntries(p))
 	}
-	return append(actions, ResetHeartbeatTimer{Interval: n.cfg.HeartbeatInterval}), nil
+	return n.finish(append(actions, ResetHeartbeatTimer{Interval: n.cfg.HeartbeatInterval}), nil)
 }
 
 // sendAppendEntries builds the AppendEntries for one peer from the Leader's
@@ -79,8 +79,9 @@ func (n *Node) sendAppendEntries(peer NodeID) Action {
 //  5. Conflict repair and append (appendFromLeader), persisted before the
 //     reply: Success with MatchIndex = PrevLogIndex + len(Entries), the
 //     last index the follower now knows to agree with the Leader.
-//
-// LeaderCommit is ignored until commit propagation is implemented.
+//  6. Only then LeaderCommit: commitIndex advances to at most that same
+//     index (followerCommit). A rejected or stale AppendEntries never
+//     touches commitIndex.
 func (n *Node) handleAppendEntries(from NodeID, ae *AppendEntries) ([]Action, error) {
 	log := n.logger.With("term", n.currentTerm, "role", n.role, "peer", from)
 	if ae.Term < n.currentTerm {
@@ -115,6 +116,7 @@ func (n *Node) handleAppendEntries(from NodeID, ae *AppendEntries) ([]Action, er
 		}
 		resp.Success = true
 		resp.MatchIndex = ae.PrevLogIndex + Index(len(ae.Entries))
+		n.followerCommit(ae.LeaderCommit, resp.MatchIndex)
 	}
 	return append(actions, SendMessage{Message: Message{
 		From: n.id, To: from, Type: MsgAppendEntriesResponse, AppendEntriesResponse: resp,
@@ -161,9 +163,18 @@ func (n *Node) appendFromLeader(entries []LogEntry) error {
 // only a follower repairing a conflict reaches it: a Leader never
 // overwrites or deletes entries in its own log (Leader Append-Only, §5.3),
 // so reaching this as Leader is a programming error and panics.
+//
+// A committed entry is never deleted either. A correct Leader cannot send
+// a conflict at or below the follower's commitIndex (Leader Completeness),
+// so such a batch comes from a faulty peer; it is refused with an error and
+// no change, which keeps commitIndex <= lastLogIndex and every applied
+// entry in the log.
 func (n *Node) truncateSuffix(from Index) error {
 	if n.role == Leader {
 		panic(fmt.Sprintf("raft: Leader %s would truncate its own log at %d (Leader Append-Only violated)", n.id, from))
+	}
+	if from <= n.commitIndex {
+		return fmt.Errorf("raft: refusing to truncate the log at %d: entries up to %d are committed", from, n.commitIndex)
 	}
 	n.logger.Info("TruncateSuffix", "term", n.currentTerm, "role", n.role,
 		"index", from, "lastIndex", n.log.lastIndex())
@@ -213,6 +224,7 @@ func (n *Node) handleAppendEntriesResponse(from NodeID, resp *AppendEntriesRespo
 	if resp.MatchIndex > n.matchIndex[from] {
 		n.matchIndex[from] = resp.MatchIndex
 		log.Info("MatchIndexAdvance", "matchIndex", resp.MatchIndex)
+		n.maybeAdvanceCommit()
 	}
 	n.nextIndex[from] = n.matchIndex[from] + 1
 	return nil, nil

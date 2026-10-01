@@ -61,7 +61,7 @@ cmd/raftnode/           real node process (later issue)
 cmd/raftctl/            client CLI (later issue)
 internal/raft/          Raft core: types, log, node, actions
 internal/storage/       Storage implementations: MemoryStorage, FileStorage; storagetest conformance suite
-internal/statemachine/  State machine implementations (KV later)
+internal/statemachine/  replicated KV state machine and its JSON command encoding
 internal/simulator/     deterministic simulator: fake clock, event queue, network, cluster harness
 internal/transport/     real transport (HTTP, later issue)
 docs/decisions/         architecture decision records
@@ -174,7 +174,7 @@ runs are issue #17.
 
 `Propose(cmd)` on the Leader appends `{Index: lastIndex+1, Term: currentTerm, cmd}`
 to storage and memory, sets `matchIndex[self]`, and returns the new index
-together with one `AppendEntries` per peer — the entry goes out immediately,
+and term together with one `AppendEntries` per peer — the entry goes out immediately,
 not on the next heartbeat. On any other node it returns a `*NotLeaderError`
 (`errors.Is(err, ErrNotLeader)`) carrying the Leader hint the node last
 heard from, or `None` if it knows of none. §5.3 of the paper, as implemented
@@ -223,6 +223,9 @@ Rules worth knowing:
   if ever called on a Leader. A same-term `AppendEntries` from another
   Leader is refused before it gets there (Election Safety), so the panic
   guards against a bug, not a message.
+- **A committed entry is never truncated**: a conflict at or below the
+  follower's `commitIndex` can only come from a faulty peer (Leader
+  Completeness), so it is refused with an error and no change.
 - **Storage first, reply after**: the follower truncates and appends in
   storage before touching its in-memory log, and replies only when both
   succeeded; a storage error returns the error to the host with no reply,
@@ -233,9 +236,8 @@ Rules worth knowing:
 Timeline events: `Propose`, `AppendEntriesSend(peer, prevIndex, prevTerm, n)`,
 `AppendEntriesReject(prevIndex, prevTerm, lastIndex, lastTerm)`,
 `TruncateSuffix(index, lastIndex)`, `AppendEntriesAck(peer, success, matchIndex)`,
-`MatchIndexAdvance(peer, matchIndex)`. Not yet: `commitIndex`/`LeaderCommit`
-handling and apply (issue #8), so `Applied` never fires and `Propose`
-returns as soon as the entry is in the Leader's own log.
+`MatchIndexAdvance(peer, matchIndex)`. What happens once an entry is on a
+majority is the next section.
 
 In the simulator, `Cluster.Propose(cmd)` routes to `Leader()` (an error
 when there is none), `SimNode.Propose(cmd)` targets one node — both return
@@ -257,6 +259,71 @@ soon as it has a Leader).
 `storage.ErrClosed`; the invariant checker skips its log until it is
 readable again, and `LogsConverged()` is false while it is closed, as it
 is for a scripted core that has no storage to observe.
+
+### Commit and apply
+
+§5.3 and §5.4.2 of the paper, in `internal/raft/commit.go`:
+
+```
+Leader, whenever a matchIndex grows (matchIndex[self] counts like a peer's):
+  N = largest index held by a majority      (sort matchIndex, take the quorum()-th largest)
+  walk N down to commitIndex+1 until log[N].Term == currentTerm, commit it
+Follower, after a successful AppendEntries only:
+  commitIndex = max(commitIndex, min(LeaderCommit, prevLogIndex+len(entries)))
+Every input (Step, ElectionTimeout, HeartbeatTimeout, Propose), once its own writes succeeded:
+  apply log[lastApplied+1 .. commitIndex] in order -> one Applied{Index, Term, Result} each
+```
+
+Rules worth knowing:
+
+- **Old-term entries are never committed by counting** (Figure 8 of the
+  paper): an entry of an earlier term may be on a majority and still be
+  overwritten by a later Leader. It becomes committed only indirectly, once
+  an entry of the current term after it is on a majority (Log Matching).
+  There is no no-op entry on election, so a new Leader commits its
+  predecessors' entries only with its first proposal.
+- **A follower's bound is the last new entry, not its last index**: entries
+  beyond `prevLogIndex+len(entries)` may be a stale suffix the Leader has not
+  reached yet. `commitIndex` never decreases, so a delayed shorter batch is
+  harmless.
+- **`Applied` comes last**: it follows every storage write and message of the
+  same input, so a host never sees a result before the state it depends on
+  is durable.
+- **Apply errors stop the apply loop**: `StateMachine.Apply` must be
+  deterministic and leave the state unchanged when it fails. The core then
+  keeps `lastApplied` just below the failed entry, returns the error with the
+  `Applied` actions produced so far, and retries that entry on its next
+  input. Skipping it would let replicas diverge. A committed entry that can
+  never apply therefore halts apply on every node, so hosts must validate
+  commands (`statemachine.Decode`) before `Propose`.
+
+The proposal lifecycle (see [ADR 0004](docs/decisions/0004-proposal-lifecycle.md)):
+`Propose` returns `(index, term)`; the host waits for `Applied` at that index.
+The same term means success, and the result is the state machine's. A
+different term means a later Leader's entry replaced the proposal: the host
+reports `raft.ErrProposalLost`. There is no client retry or deduplication in
+the MVP. A client that gives up waiting cannot tell whether its command will
+still be committed, and resubmitting it may apply it twice.
+
+The state machine is `statemachine.KV`. Commands are JSON in
+`LogEntry.Command`, built with `statemachine.Set(key, value)` →
+`{"op":"SET","key":"x","value":"1"}` (the result is the value) and
+`statemachine.Get(key)` (applied through the log, the result is the value
+at that log position). `KV.Get(key)` is the local read path: whatever this
+replica has applied, which is not linearizable.
+
+Timeline events: `CommitAdvance(commitIndex)`, `Apply(index, lastApplied)`,
+and the host's `Applied(index, term)`.
+
+In the simulator every node created by `NewCluster` applies to its own
+`KV`. `Cluster.Submit(cmd)` is the client's whole request: it proposes to
+`Leader()` and runs the simulation until that node applies the entry. It
+returns the result, `raft.ErrProposalLost`, or `ErrSubmitTimeout` after
+`Config.SubmitTimeout` (default 1s of simulated time), when the Leader cannot
+reach a majority. `Cluster.Await(node, index, term)` is the waiting half
+alone, for tests that change the network between proposing and waiting.
+`SimNode.Applied()` is a node's apply history, and `Cluster.StateMachines()`
+lets tests compare replicas (`KV.Bytes()` is a canonical encoding).
 
 ### Persistence
 
@@ -309,7 +376,8 @@ every test is reproducible from its seed. Its pieces:
   delivery carries its own deep copy of the message, as serialization would
   on a real transport.
 - `Cluster` — hosts N `*raft.Node`s over `MemoryStorage` (or stores
-  pre-loaded through `Config.Stores`), arms their first election timers via
+  pre-loaded through `Config.Stores`), each with its own `statemachine.KV`,
+  arms their first election timers via
   `Start()`, translates the `Action`s they return into timers and sends, and
   drives everything with `Run(until)`, `Step()` or `RunUntil(pred, maxTime)`.
   `Leader()` returns the unique Leader of the highest term, `Roles()` every
@@ -326,8 +394,15 @@ every test is reproducible from its seed. Its pieces:
   (for every pair of nodes, an entry with the same index and term implies
   identical logs up to it, commands included), Leader Append-Only (while a
   node leads a term, the log it had last time must be a prefix of the one
-  it has now) and Storage Consistency (`Status().LastLogIndex/LastLogTerm`
-  match the last entry actually persisted).
+  it has now), Storage Consistency (`Status().LastLogIndex/LastLogTerm`
+  match the last entry actually persisted), Monotonic Progress
+  (`commitIndex` and `lastApplied` never decrease), Apply/Commit Bounds
+  (`lastApplied <= commitIndex <= lastLogIndex`), State Machine Safety (every
+  node holds the same entry at every index it has committed, and every
+  node's apply history is a prefix of one common sequence of entries and
+  results), Apply Order (a node applies 1, 2, 3, ...) and Leader Completeness
+  (a Leader holds every entry committed in an earlier term than its own; a
+  deposed Leader of an older term may lack later commits, which is legal).
   `AssertInvariants()` returns them; the test helper calls it at the end of
   every simulator test.
 

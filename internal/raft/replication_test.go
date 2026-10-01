@@ -52,7 +52,8 @@ func makeFollower(t *testing.T) (*Node, *memStorage) {
 // TestHeartbeatBroadcast: a heartbeat is the same AppendEntries replication
 // uses, built per peer from nextIndex. A peer that has acknowledged the
 // whole log gets an empty message with prev = last entry; a peer that has
-// not gets the missing suffix.
+// not gets the missing suffix. Both carry the Leader's commitIndex, here 1:
+// b's acknowledgment made entry 1 a majority with the Leader.
 func TestHeartbeatBroadcast(t *testing.T) {
 	n, _ := makeLeader(t)
 	propose(t, n, "x")
@@ -73,11 +74,11 @@ func TestHeartbeatBroadcast(t *testing.T) {
 		}
 	}
 	b, c := msgs[0].AppendEntries, msgs[1].AppendEntries
-	if b.Term != 1 || b.LeaderID != "a" || b.PrevLogIndex != 1 || b.PrevLogTerm != 1 || len(b.Entries) != 0 || b.LeaderCommit != 0 {
-		t.Fatalf("heartbeat to b = %+v, want term 1, leader a, prev (1,1), no entries, commit 0", *b)
+	if b.Term != 1 || b.LeaderID != "a" || b.PrevLogIndex != 1 || b.PrevLogTerm != 1 || len(b.Entries) != 0 || b.LeaderCommit != 1 {
+		t.Fatalf("heartbeat to b = %+v, want term 1, leader a, prev (1,1), no entries, commit 1", *b)
 	}
-	if c.PrevLogIndex != 0 || c.PrevLogTerm != 0 || len(c.Entries) != 1 || c.Entries[0].Index != 1 {
-		t.Fatalf("heartbeat to c = %+v, want prev (0,0) carrying entry 1", *c)
+	if c.PrevLogIndex != 0 || c.PrevLogTerm != 0 || len(c.Entries) != 1 || c.Entries[0].Index != 1 || c.LeaderCommit != 1 {
+		t.Fatalf("heartbeat to c = %+v, want prev (0,0) carrying entry 1, commit 1", *c)
 	}
 	if countActions(actions, ResetHeartbeatTimer{}) != 1 || countActions(actions, ResetElectionTimer{}) != 0 {
 		t.Fatalf("actions = %v, want exactly one ResetHeartbeatTimer and no election timer", actions)
@@ -260,8 +261,8 @@ func TestAppendEntriesResponseAdvancesMatchIndex(t *testing.T) {
 	propose(t, n, "z")
 
 	actions := step(t, n, appendResp("b", "a", 1, true, 3))
-	if len(actions) != 0 {
-		t.Fatalf("actions after a success = %v, want none (nothing left to send)", actions)
+	if msgs := sends(actions); len(msgs) != 0 {
+		t.Fatalf("sent %v after a success, want nothing (nothing left to send)", msgs)
 	}
 	if n.matchIndex["b"] != 3 || n.nextIndex["b"] != 4 {
 		t.Fatalf("b: match=%d next=%d, want 3/4", n.matchIndex["b"], n.nextIndex["b"])

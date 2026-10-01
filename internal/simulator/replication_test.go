@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/iceboundrock/miniraft/internal/raft"
+	"github.com/iceboundrock/miniraft/internal/statemachine"
 	"github.com/iceboundrock/miniraft/internal/storage"
 )
 
@@ -57,8 +58,19 @@ func pairs(terms []raft.Term) [][2]uint64 {
 	return out
 }
 
-// requireLogEquals fails unless n's log has exactly the given commands, in
-// order.
+// setCmd encodes a command written as "SET key value" the way
+// statemachine.KV expects it, so tests read like the client protocol while
+// every node can apply what is committed.
+func setCmd(text string) []byte {
+	f := strings.Fields(text)
+	if len(f) != 3 || f[0] != statemachine.OpSet {
+		panic(fmt.Sprintf("setCmd(%q): want \"SET key value\"", text))
+	}
+	return statemachine.Set(f[1], f[2])
+}
+
+// requireLogEquals fails unless n's log has exactly the given commands
+// (written as for setCmd), in order.
 func requireLogEquals(t *testing.T, n *SimNode, want ...string) {
 	t.Helper()
 	log := n.Log()
@@ -66,17 +78,18 @@ func requireLogEquals(t *testing.T, n *SimNode, want ...string) {
 		t.Fatalf("%s log has %d entries, want %d", n.ID(), len(log), len(want))
 	}
 	for i, e := range log {
-		if e.Index != raft.Index(i+1) || string(e.Command) != want[i] {
-			t.Fatalf("%s log[%d] = %+v, want index %d command %q", n.ID(), i, e, i+1, want[i])
+		if e.Index != raft.Index(i+1) || string(e.Command) != string(setCmd(want[i])) {
+			t.Fatalf("%s log[%d] = (%d, %d, %s), want index %d command %s", n.ID(), i, e.Index, e.Term, e.Command, i+1, setCmd(want[i]))
 		}
 	}
 }
 
-// proposeAll proposes each command through the cluster, failing on error.
+// proposeAll proposes each command (written as for setCmd) through the
+// cluster, failing on error.
 func proposeAll(t *testing.T, c *Cluster, cmds ...string) {
 	t.Helper()
 	for _, cmd := range cmds {
-		if _, err := c.Propose([]byte(cmd)); err != nil {
+		if _, _, err := c.Propose(setCmd(cmd)); err != nil {
 			t.Fatalf("Propose(%q): %v", cmd, err)
 		}
 	}
@@ -85,7 +98,7 @@ func proposeAll(t *testing.T, c *Cluster, cmds ...string) {
 func TestProposeReplicatesToFollowers(t *testing.T) {
 	c := newTestCluster(t, Config{Seed: 1, NodeIDs: []raft.NodeID{"a", "b", "c"}})
 	leader := electLeader(t, c)
-	idx, err := c.Propose([]byte("SET x 1"))
+	idx, _, err := c.Propose(setCmd("SET x 1"))
 	if err != nil || idx != 1 {
 		t.Fatalf("Propose = (%d, %v), want index 1", idx, err)
 	}
@@ -283,7 +296,7 @@ func TestDuplicateAppendEntriesIsIdempotent(t *testing.T) {
 
 func TestProposeOnFollowerReturnsErrNotLeader(t *testing.T) {
 	c := newTestCluster(t, Config{Seed: 1, NodeIDs: []raft.NodeID{"a", "b", "c"}})
-	if _, err := c.Propose([]byte("SET x 1")); err == nil {
+	if _, _, err := c.Propose(setCmd("SET x 1")); err == nil {
 		t.Fatal("Cluster.Propose succeeded with no Leader")
 	}
 	leader := electLeader(t, c)
@@ -292,7 +305,7 @@ func TestProposeOnFollowerReturnsErrNotLeader(t *testing.T) {
 		if n == leader {
 			continue
 		}
-		_, err := n.Propose([]byte("SET x 1"))
+		_, _, err := n.Propose(setCmd("SET x 1"))
 		var nl *raft.NotLeaderError
 		if !errors.Is(err, raft.ErrNotLeader) || !errors.As(err, &nl) || nl.LeaderID != leader.ID() {
 			t.Fatalf("%s.Propose = %v, want NotLeaderError naming %s", n.ID(), err, leader.ID())
@@ -345,7 +358,7 @@ func TestFigure7Scenarios(t *testing.T) {
 			if leader.ID() != "a" || leader.Status().Term != 8 {
 				t.Fatalf("Leader = %s in term %d, want a in term 8", leader.ID(), leader.Status().Term)
 			}
-			if idx, err := c.Propose([]byte("SET x 1")); err != nil || idx != 11 {
+			if idx, _, err := c.Propose(setCmd("SET x 1")); err != nil || idx != 11 {
 				t.Fatalf("Propose = (%d, %v), want index 11", idx, err)
 			}
 			requireConverged(t, c, 2*time.Second)
@@ -650,7 +663,7 @@ func TestProposeOnClosedStorage(t *testing.T) {
 	if err := leader.Storage.Close(); err != nil {
 		t.Fatal(err)
 	}
-	idx, err := leader.Propose([]byte("SET x 1"))
+	idx, _, err := leader.Propose(setCmd("SET x 1"))
 	if !errors.Is(err, storage.ErrClosed) || idx != 0 {
 		t.Fatalf("Propose = (%d, %v), want (0, %v)", idx, err, storage.ErrClosed)
 	}

@@ -5,12 +5,16 @@ import (
 	"testing"
 )
 
-// propose drives n.Propose, failing the test on error.
+// propose drives n.Propose, failing the test on error or when the returned
+// term is not the Leader's current term.
 func propose(t *testing.T, n *Node, cmd string) (Index, []Action) {
 	t.Helper()
-	idx, actions, err := n.Propose([]byte(cmd))
+	idx, term, actions, err := n.Propose([]byte(cmd))
 	if err != nil {
 		t.Fatalf("Propose(%q): %v", cmd, err)
+	}
+	if term != n.Status().Term {
+		t.Fatalf("Propose(%q) returned term %d, want the Leader's term %d", cmd, term, n.Status().Term)
 	}
 	return idx, actions
 }
@@ -92,7 +96,7 @@ func TestProposeAppendsAndReplicates(t *testing.T) {
 func TestProposeCommandIsCopied(t *testing.T) {
 	n, st := makeLeader(t)
 	cmd := []byte("SET x 1")
-	if _, _, err := n.Propose(cmd); err != nil {
+	if _, _, _, err := n.Propose(cmd); err != nil {
 		t.Fatal(err)
 	}
 	cmd[0] = 'X'
@@ -106,7 +110,7 @@ func TestProposeOnFollowerReturnsErrNotLeader(t *testing.T) {
 	t.Run("follower with known leader", func(t *testing.T) {
 		n, st := makeFollower(t)
 		step(t, n, heartbeat("b", "a", 1, 0, 0))
-		_, actions, err := n.Propose([]byte("SET x 1"))
+		_, _, actions, err := n.Propose([]byte("SET x 1"))
 		if !errors.Is(err, ErrNotLeader) || len(actions) != 0 {
 			t.Fatalf("Propose = (%v, %v), want ErrNotLeader and no actions", actions, err)
 		}
@@ -120,7 +124,7 @@ func TestProposeOnFollowerReturnsErrNotLeader(t *testing.T) {
 		st := &memStorage{}
 		n := newTestNode(t, testConfig("a", "b", "c"), st)
 		electionTimeout(t, n)
-		_, _, err := n.Propose([]byte("SET x 1"))
+		_, _, _, err := n.Propose([]byte("SET x 1"))
 		var nl *NotLeaderError
 		if !errors.As(err, &nl) || nl.LeaderID != None {
 			t.Fatalf("Propose = %v, want NotLeaderError with no leader hint", err)
@@ -135,7 +139,7 @@ func TestProposeStorageFailure(t *testing.T) {
 	n, st := makeLeader(t)
 	boom := errors.New("disk full")
 	st.failAppend = boom
-	_, actions, err := n.Propose([]byte("SET x 1"))
+	_, _, actions, err := n.Propose([]byte("SET x 1"))
 	if !errors.Is(err, boom) || len(actions) != 0 {
 		t.Fatalf("Propose = (%v, %v), want the storage error and no actions", actions, err)
 	}
@@ -149,16 +153,20 @@ func TestProposeStorageFailure(t *testing.T) {
 	}
 }
 
-// TestSingleNodeProposeSendsNothing: with no peers there is nobody to
-// replicate to; the entry is still appended.
-func TestSingleNodeProposeSendsNothing(t *testing.T) {
+// TestSingleNodeProposeCommitsAtOnce: with no peers there is nobody to
+// replicate to, so nothing is sent; the entry is still appended, and since
+// the Leader alone is a majority of one, it is committed and applied by
+// Propose itself.
+func TestSingleNodeProposeCommitsAtOnce(t *testing.T) {
 	st := &memStorage{}
 	n := newTestNode(t, testConfig("a"), st)
 	electionTimeout(t, n)
 	requireStatus(t, n, Leader, 1, "a")
 	idx, actions := propose(t, n, "SET x 1")
-	if idx != 1 || len(actions) != 0 {
-		t.Fatalf("Propose = (%d, %v), want index 1 and no actions", idx, actions)
+	if idx != 1 || len(sends(actions)) != 0 {
+		t.Fatalf("Propose = (%d, %v), want index 1 and no messages", idx, actions)
 	}
 	requireLog(t, n, st, []LogEntry{{Index: 1, Term: 1, Command: []byte("SET x 1")}})
+	requireCommit(t, n, 1, 1)
+	requireApplied(t, actions, [2]uint64{1, 1})
 }
